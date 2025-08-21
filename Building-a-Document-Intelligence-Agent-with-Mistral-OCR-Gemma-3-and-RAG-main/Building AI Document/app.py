@@ -790,3 +790,4 @@ if st.session_state.get("documents"):
             st.markdown(f"### {doc['name']} ({doc['type']})")
             st.markdown(doc['content'])
             st.markdown("---")
+
