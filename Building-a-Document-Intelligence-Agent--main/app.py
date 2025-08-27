@@ -7,9 +7,8 @@ import time
 import numpy as np
 import re
 from urllib.parse import urljoin
-from typing import List, Optional, Dict, Tuple
-
 import pandas as pd
+import difflib  # fuzzy matching nama kolom
 
 # Mistral 0.4.2 (legacy client)
 from mistralai.client import MistralClient
@@ -18,26 +17,33 @@ import google.generativeai as genai
 from PIL import Image
 from PyPDF2 import PdfReader
 
-# Word document processing
-try:
-    from docx import Document
-    HAS_DOCX = True
-except ImportError:
-    HAS_DOCX = False
-
-try:
-    import docx2txt
-    HAS_DOCX2TXT = True
-except ImportError:
-    HAS_DOCX2TXT = False
-
-# --- Dashboard
+# --- Tambahan import untuk dashboard ---
 import plotly.express as px
 import plotly.graph_objects as go
+from collections import Counter
 import json
 import string
+import subprocess
 
-# WordCloud opsional
+# --- DOCX import with friendly error ---
+try:
+    # modul bernama "docx" disediakan oleh paket "python-docx"
+    from docx import Document  # pip install python-docx
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+except Exception as e:
+    st.error(
+        "Paket yang benar untuk .docx adalah **python-docx**. "
+        "Sepertinya paket **docx** (yang salah) terpasang dan menyebabkan konflik.\n\n"
+        "Perbaikan cepat:\n"
+        "1) aktifkan venv\n"
+        "2) `pip uninstall -y docx`\n"
+        "3) `pip install --upgrade python-docx`\n\n"
+        f"Detail error: {e}"
+    )
+    raise
+
+# WordCloud opsional (fallback otomatis kalau belum terpasang)
 try:
     from wordcloud import WordCloud
     HAS_WORDCLOUD = True
@@ -48,8 +54,20 @@ except Exception:
 # --------------------- Page config ---------------------
 st.set_page_config(page_title="Document Intelligence Agent", layout="wide")
 st.title("Document Intelligence Agent")
-st.markdown("Upload documents or URL to extract information and ask questions")
+st.caption("Upload documents or URL → extract, render (DOCX tables preserved), and ask questions.")
 
+# --------------------- Global CSS (stabilkan tabel DOCX) ---------------------
+st.markdown("""
+<style>
+.docx-table { width:100%; border-collapse:collapse; table-layout:fixed; margin:8px 0; }
+.docx-table col { }
+.docx-table th, .docx-table td {
+  border:1px solid #ccc; padding:6px; vertical-align:top;
+  white-space:pre-wrap; word-break:keep-all; overflow-wrap:anywhere;
+}
+.docx-table th { font-weight:700; }
+</style>
+""", unsafe_allow_html=True)
 
 # --------------------- Sidebar: API Keys ----------------
 with st.sidebar:
@@ -70,14 +88,19 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.caption("Tutorial API Key (YouTube)")
-    st.markdown("- Mistral AI API Key — YouTube\n- Google API Key (Gemini) — YouTube")
+    st.markdown("How To Get API Key Tutorials")
+    st.markdown(
+        """
+- **Mistral AI API Key** — [YouTube Tutorial](https://youtu.be/NUCcUFwfhlA?si=iLrFFxVtcFUp657C)  
+- **Google API Key (Gemini)** — [YouTube Tutorial](https://youtu.be/IHj7wF-8ry8?si=VKvhMM3pMeKwkXAv)
+        """
+    )
 
 # Disimpan global agar helper bisa akses
 MODEL_PREFERENCE = model_preference
 ANSWER_LANGUAGE = answer_language
 
-# MistralClient (legacy)
+# MistralClient (legacy) — tidak untuk OCR di 0.4.2
 mistral_client = None
 if mistral_api_key:
     try:
@@ -86,14 +109,13 @@ if mistral_api_key:
     except Exception as e:
         st.error(f"Failed to initialize Mistral client: {e}")
 
-# Gemini
+# Gemini untuk OCR & QnA
 if google_api_key:
     try:
         genai.configure(api_key=google_api_key)
         st.success("✅ Google API connected")
     except Exception as e:
         st.error(f"Failed to initialize Google API: {e}")
-
 
 # --------------------- Helpers (Gemini OCR) -------------------------
 def _is_quota_error(err: Exception) -> bool:
@@ -142,8 +164,7 @@ def _truncate_context(text: str, max_chars: int = 20000) -> str:
         return text
     return text[:max_chars]
 
-
-# --------------------- RAG (opsional mini) ---------------------
+# --------------------- Text chunking & Embeddings (RAG) ---------------------
 EMBEDDING_MODEL = "models/text-embedding-004"
 
 def _chunk_text(text: str, chunk_size: int = 1800, overlap: int = 200) -> list:
@@ -195,8 +216,10 @@ def _build_retrieval_index(full_text: str):
         return
     chunks = _chunk_text(full_text)
     embeddings = []
+
     max_chunks = min(len(chunks), 10)
     chunks = chunks[:max_chunks]
+    
     for ch in chunks:
         try:
             vec = _embed_text(ch)
@@ -204,9 +227,14 @@ def _build_retrieval_index(full_text: str):
                 embeddings = []
                 break
             embeddings.append(vec)
-        except Exception:
-            embeddings = []
-            break
+        except Exception as e:
+            if "429" in str(e) or "quota" in str(e).lower():
+                st.warning("⚠️ Gemini embedding quota exceeded. Using full-context fallback.")
+                embeddings = []
+                break
+            else:
+                embeddings = []
+                break
     
     if embeddings:
         matrix = np.vstack(embeddings)
@@ -238,8 +266,6 @@ def _retrieve_top_k(query: str, k: int = 5) -> list:
     top_idx = np.argsort(-sims)[: max(1, k)]
     return [chunks[i] for i in top_idx]
 
-
-# --------------------- Ekstraksi dokumen ---------------------
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -251,30 +277,278 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     except Exception:
         return ""
 
-def extract_text_from_word_bytes(word_bytes: bytes, filename: str) -> str:
-    try:
-        if filename.lower().endswith('.docx') and HAS_DOCX:
-            doc = Document(io.BytesIO(word_bytes))
-            text_parts = []
-            for paragraph in doc.paragraphs:
-                if paragraph.text.strip():
-                    text_parts.append(paragraph.text.strip())
-            for table in doc.tables:
-                for row in table.rows:
-                    row_text = []
-                    for cell in row.cells:
-                        if cell.text.strip():
-                            row_text.append(cell.text.strip())
-                    if row_text:
-                        text_parts.append(" | ".join(row_text))
-            return "\n\n".join(text_parts)
-        if HAS_DOCX2TXT:
-            return docx2txt.process(io.BytesIO(word_bytes))
+# ===== DOCX → HTML (preserve tables, colspan/rowspan, basic styles) =====
+from html import escape
+
+def _run_to_html(run):
+    text = escape(run.text or "")
+    if not text:
         return ""
-    except Exception as e:
-        st.warning(f"Word document text extraction failed: {e}. Falling back to OCR.")
+    if run.bold:
+        text = f"<strong>{text}</strong>"
+    if run.italic:
+        text = f"<em>{text}</em>"
+    if run.underline:
+        text = f"<u>{text}</u>"
+    return text
+
+def _para_to_html(para):
+    align = getattr(para.paragraph_format, "alignment", None)
+    align_map = {0:"left", 1:"center", 2:"right", 3:"justify"}  # WD_ALIGN_PARAGRAPH
+    style = ""
+    if align is not None:
+        style = f' style="text-align:{align_map.get(int(align), "left")};"'
+    content = "".join(_run_to_html(r) for r in para.runs)
+    return f"<p{style}>{content}</p>"
+
+def _get_tblgrid_widths(table):
+    """Ambil lebar kolom dari w:tblGrid/w:gridCol[@w:w] (dalam twips)."""
+    try:
+        grid = table._tbl.tblGrid
+        if grid is None:
+            max_cols = max(len(r.cells) for r in table.rows) if table.rows else 0
+            return [1]*max_cols
+        widths = []
+        for gc in grid.iterchildren():
+            if gc.tag.endswith('gridCol'):
+                w = gc.get(qn('w:w'))
+                widths.append(int(w) if w else 1)
+        return widths if widths else [1]
+    except Exception:
+        max_cols = max(len(r.cells) for r in table.rows) if table.rows else 0
+        return [1]*max_cols
+
+def _cell_gridspan(cell) -> int:
+    try:
+        tcPr = cell._tc.tcPr
+        if tcPr is not None and tcPr.gridSpan is not None:
+            return int(tcPr.gridSpan.val)
+    except Exception:
+        pass
+    return 1
+
+def _cell_vmerge_state(cell) -> str | None:
+    """
+    return 'restart' | 'continue' | None
+    """
+    try:
+        tcPr = cell._tc.tcPr
+        if tcPr is None or tcPr.vMerge is None:
+            return None
+        v = tcPr.vMerge.val
+        if v in (None, 'continue'):
+            return 'continue'
+        if v == 'restart':
+            return 'restart'
+        return 'continue'
+    except Exception:
+        return None
+
+def _row_vrowspans(table):
+    """
+    Untuk setiap cell, kembalikan num rowspan efektif:
+      - 0  → vMerge continue (jangan render)
+      - >=1 → render di baris ini dengan rowspan tsb
+    """
+    n_rows = len(table.rows)
+    result = []
+    for r in range(n_rows):
+        row = table.rows[r]
+        arr = []
+        for c, cell in enumerate(row.cells):
+            stt = _cell_vmerge_state(cell)
+            if stt == 'restart':
+                span = 1
+                rr = r+1
+                while rr < n_rows:
+                    try:
+                        next_cell = table.rows[rr].cells[c]
+                    except Exception:
+                        break
+                    st2 = _cell_vmerge_state(next_cell)
+                    if st2 == 'continue':
+                        span += 1; rr += 1
+                    else:
+                        break
+                arr.append(span)
+            elif stt == 'continue':
+                arr.append(0)
+            else:
+                arr.append(1)
+        result.append(arr)
+    return result
+
+def docx_table_to_html(table):
+    """
+    Render tabel DOCX ke HTML:
+      - Menghormati w:tblGrid (lebar kolom) → <colgroup>
+      - Menangani gridSpan (colspan) dan vMerge (rowspan) akurat
+      - Skip sel yang tertutup merge (pakai matriks occupied pada grid kolom)
+    """
+    grid_widths = _get_tblgrid_widths(table)           # twips per grid column
+    grid_cols = len(grid_widths)
+    n_rows = len(table.rows)
+    if n_rows == 0 or grid_cols == 0:
+        return '<table class="docx-table"></table>'
+
+    total_w = max(1, sum(grid_widths))
+    col_perc = [max(1, int(round(w*100/total_w))) for w in grid_widths]
+    diff = 100 - sum(col_perc)
+    if diff != 0:
+        col_perc[-1] = max(1, col_perc[-1] + diff)
+
+    rowspans = _row_vrowspans(table)
+    occupied = [[False]*grid_cols for _ in range(n_rows)]
+
+    parts = []
+    parts.append('<table class="docx-table">')
+    parts.append('<colgroup>')
+    for p in col_perc:
+        parts.append(f'<col style="width:{p}%">')
+    parts.append('</colgroup>')
+
+    for r_idx, row in enumerate(table.rows):
+        parts.append('<tr>')
+        cpos = 0  # posisi grid kolom saat ini
+
+        for c_idx, cell in enumerate(row.cells):
+            rs = rowspans[r_idx][c_idx] if r_idx < len(rowspans) and c_idx < len(rowspans[r_idx]) else 1
+            if rs == 0:
+                continue  # vMerge-continue
+
+            while cpos < grid_cols and occupied[r_idx][cpos]:
+                cpos += 1
+            if cpos >= grid_cols:
+                continue
+
+            cs = max(1, _cell_gridspan(cell))
+
+            for rr in range(r_idx, min(n_rows, r_idx+rs)):
+                for cc in range(cpos, min(grid_cols, cpos+cs)):
+                    occupied[rr][cc] = True
+
+            inner = "".join(_para_to_html(p) for p in cell.paragraphs) or "&nbsp;"
+            tag = "th" if r_idx == 0 else "td"
+
+            attrs = []
+            if cs > 1:
+                attrs.append(f'colspan="{cs}"')
+            if rs > 1:
+                attrs.append(f'rowspan="{rs}"')
+
+            parts.append(f"<{tag} {' '.join(attrs)}>{inner}</{tag}>")
+            cpos += cs
+
+        parts.append('</tr>')
+
+    parts.append('</table>')
+    return "".join(parts)
+
+def docx_to_html(doc):
+    """Konversi DOCX ke HTML ringan dengan tabel dipertahankan."""
+    out = []
+    for block in doc.element.body.iterchildren():
+        tag = block.tag
+        if tag == qn('w:tbl'):
+            tbl = None
+            for t in doc.tables:
+                if t._tbl is block:
+                    tbl = t; break
+            if tbl is not None:
+                out.append(docx_table_to_html(tbl))
+        elif tag == qn('w:p'):
+            for para in doc.paragraphs:
+                if para._p is block:
+                    out.append(_para_to_html(para))
+                    break
+    return "\n".join(out).strip()
+
+# --------------------- DOC/DOCX extractors -------------------------
+def extract_text_from_docx_bytes(docx_bytes: bytes) -> str:
+    """Return HTML yang mempertahankan struktur tabel (colspan/rowspan, align, bold/italic)."""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+            tmp.write(docx_bytes)
+            tmp_path = tmp.name
+        doc = Document(tmp_path)
+
+        html = docx_to_html(doc)
+
+        if not html or len(html) < 20:
+            parts = []
+            parts.extend(_para_to_html(p) for p in doc.paragraphs if p.text)
+            for tbl in doc.tables:
+                parts.append(docx_table_to_html(tbl))
+            html = "\n".join(parts)
+
+        return html
+    except Exception:
+        return ""
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+def extract_text_from_doc_bytes(doc_bytes: bytes) -> str:
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "in.doc")
+            with open(src, "wb") as f:
+                f.write(doc_bytes)
+
+            # unoconv -> txt
+            try:
+                subprocess.run(["unoconv", "-f", "txt", src], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                txt_path = src.replace(".doc", ".txt")
+                if os.path.exists(txt_path):
+                    with open(txt_path, "r", encoding="utf-8", errors="ignore") as t:
+                        return t.read()
+            except Exception:
+                pass
+
+            # soffice -> txt
+            try:
+                subprocess.run(
+                    ["soffice", "--headless", "--convert-to", "txt:Text", "--outdir", td, src],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                base = os.path.splitext(os.path.basename(src))[0]
+                txt_path = os.path.join(td, base + ".txt")
+                if os.path.exists(txt_path):
+                    with open(txt_path, "r", encoding="utf-8", errors="ignore") as t:
+                        return t.read()
+            except Exception:
+                pass
+
+            # soffice -> pdf -> extractor PDF / OCR Gemini
+            try:
+                subprocess.run(
+                    ["soffice", "--headless", "--convert-to", "pdf", "--outdir", td, src],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                pdf_path = os.path.join(td, "in.pdf")
+                if os.path.exists(pdf_path):
+                    with open(pdf_path, "rb") as pf:
+                        pdf_bytes = pf.read()
+                    txt = extract_text_from_pdf_bytes(pdf_bytes)
+                    if txt and len(txt) > 30:
+                        return txt
+                    return gemini_ocr_pdf(pdf_bytes, filename="converted_from_doc.pdf")
+            except Exception:
+                pass
+
+            # strings (last resort)
+            try:
+                out = subprocess.run(["strings", src], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                txt = out.stdout.decode("utf-8", errors="ignore")
+                return txt
+            except Exception:
+                return ""
+    except Exception:
         return ""
 
+# --------------------- OCR helpers -------------------------
 def gemini_ocr_image(image_bytes: bytes) -> str:
     img = Image.open(io.BytesIO(image_bytes))
     prompt_doc = (
@@ -284,21 +558,31 @@ def gemini_ocr_image(image_bytes: bytes) -> str:
     )
     text = _generate_with_fallback([prompt_doc, img])
     if not text or len(text.strip()) < 30:
-        prompt_cap_id = ("Jelaskan gambar ini secara ringkas, jelas, dan akurat. "
-                         "Sebutkan objek utama, konteks, warna, teks (jika ada), dan hal penting lainnya.")
-        prompt_cap_en = ("Describe this image concisely and accurately. "
-                         "Mention main objects, context, colors, any visible text, and other important details.")
+        prompt_cap_id = (
+            "Jelaskan gambar ini secara ringkas, jelas, dan akurat. "
+            "Sebutkan objek utama, konteks, warna, teks (jika ada), dan hal penting lainnya."
+        )
+        prompt_cap_en = (
+            "Describe this image concisely and accurately. "
+            "Mention main objects, context, colors, any visible text, and other important details."
+        )
         prompt_cap = prompt_cap_id if ANSWER_LANGUAGE == "Bahasa Indonesia" else prompt_cap_en
         text = _generate_with_fallback([prompt_cap, img])
     return text
 
 def gemini_ocr_pdf(pdf_bytes: bytes, filename: str = "upload.pdf") -> str:
+    if not google_api_key:
+        return "Please provide a valid Google API Key for OCR/processing."
     suffix = os.path.splitext(filename)[1] or ".pdf"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
     try:
-        file_obj = genai.upload_file(path=tmp_path, mime_type="application/pdf", display_name=filename)
+        file_obj = genai.upload_file(
+            path=tmp_path,
+            mime_type="application/pdf",
+            display_name=filename
+        )
         try:
             for _ in range(30):
                 f = genai.get_file(file_obj.name)
@@ -310,8 +594,10 @@ def gemini_ocr_pdf(pdf_bytes: bytes, filename: str = "upload.pdf") -> str:
                 return "Error: File processing timed out. Please try again."
         except Exception:
             time.sleep(2)
-        prompt = ("Extract the full content of this PDF as clean Markdown. "
-                  "Preserve headings and tables. If pages are scanned, perform OCR first.")
+        prompt = (
+            "Extract the full content of this PDF as clean Markdown. "
+            "Preserve headings and tables. If pages are scanned, perform OCR first."
+        )
         return _generate_with_fallback([file_obj, prompt])
     finally:
         try:
@@ -319,353 +605,59 @@ def gemini_ocr_pdf(pdf_bytes: bytes, filename: str = "upload.pdf") -> str:
         except Exception:
             pass
 
+# --------------------- PDF/Image/DOC/DOCX pipeline -------------------------
 def process_document_with_gemini(kind: str, name: str, data: bytes) -> str:
     if kind == "pdf":
-        text = extract_text_from_pdf_bytes(data)
-        if len(text) >= 200:
-            return text
+        raw_text = extract_text_from_pdf_bytes(data)
+        looks_like_table = bool(re.search(r'\|\s*[^|]+\s*\|', raw_text))
+        if len(raw_text) >= 200 and looks_like_table:
+            return raw_text
         return gemini_ocr_pdf(data, filename=name)
-    elif kind == "word":
-        text = extract_text_from_word_bytes(data, name)
-        if len(text) >= 100:
-            return text
-        return gemini_ocr_pdf(data, filename=name)
-    else:  # image
+
+    if kind == "image":
         return gemini_ocr_image(data)
+
+    if kind == "docx":
+        html = extract_text_from_docx_bytes(data)
+        if html and len(html) >= 50:
+            return html
+        return _generate_with_fallback([
+            "Extract the full content of this Office document as HTML with tables preserved.",
+            data
+        ])
+
+    if kind == "doc":
+        text = extract_text_from_doc_bytes(data)
+        if text and len(text) >= 50:
+            return text
+        return "No content extracted from .doc (older Word). Please ensure LibreOffice/unoconv is installed for better results."
+
+    return "Unsupported document kind."
 
 def answer_from_image(image_bytes: bytes, question: str) -> str:
     try:
         img = Image.open(io.BytesIO(image_bytes))
         if ANSWER_LANGUAGE == "Bahasa Indonesia":
-            prompt = ("Anda adalah asisten analisis visual. Jawab pertanyaan pengguna hanya berdasarkan gambar ini.\n"
-                      "Jika informasi tidak terlihat pada gambar, katakan tidak ada.\n"
-                      f"Pertanyaan: {question}")
+            prompt = (
+                "Anda adalah asisten analisis visual. Jawab pertanyaan pengguna hanya berdasarkan gambar ini.\n"
+                "Jika informasi tidak terlihat pada gambar, katakan tidak ada.\n"
+                f"Pertanyaan: {question}"
+            )
         else:
-            prompt = ("You are a visual analysis assistant. Answer the user's question based only on this image.\n"
-                      "If the information is not visible in the image, say so.\n"
-                      f"Question: {question}")
+            prompt = (
+                "You are a visual analysis assistant. Answer the user's question based only on this image.\n"
+                "If the information is not visible in the image, say so.\n"
+                f"Question: {question}"
+            )
         return _generate_with_fallback([prompt, img]) or "No response text."
     except Exception as e:
         return f"Error generating visual answer: {e}"
 
-
-# ===================== ANGKA & TABEL (ROBUST & FLEXIBLE) =====================
-_num_pat = re.compile(r"([\-]?\d{1,3}(?:[\.,]\d{3})*(?:[\.,]\d{1,2})?)")
-nim_hp_pat = re.compile(r"^\d{8,}$")  # 8+ digit beruntun → kemungkinan NIM/HP
-LIKELY_SCORE_COLS = {"nilai","skor","score","uts","uas","rata-rata","rata2","rata_rata"}
-
-def looks_like_id_or_phone(raw: str) -> bool:
-    raw = str(raw).strip()
-    raw = re.sub(r"[^\d]", "", raw)  # buang pemisah
-    return bool(nim_hp_pat.match(raw))
-
-def _parse_number(s: str) -> Optional[float]:
-    """
-    Parser angka lintas-lokal:
-    - Decimal koma ('96,29'), decimal titik ('93.7')
-    - Ribuan titik '1.234,56' atau ribuan koma '1,234.56'
-    - Persen '85,2%' -> 0.852
-    - Negatif pakai kurung '(1.234,56)' -> -1234.56
-    """
-    if s is None:
-        return None
-    s = str(s).strip()
-    if s == "" or s.lower() in {"nan", "none", "null", "-"}:
-        return None
-
-    # ID/HP langsung discard
-    if looks_like_id_or_phone(s):
-        return None
-
-    neg = False
-    if s.startswith("(") and s.endswith(")"):
-        neg = True
-        s = s[1:-1].strip()
-
-    s_clean = re.sub(r"[^\d\.,%-]", "", s)
-    is_percent = s_clean.endswith("%")
-    if is_percent:
-        s_clean = s_clean[:-1]
-
-    last_dot = s_clean.rfind(".")
-    last_com = s_clean.rfind(",")
-
-    def apply_decimal(dec_char, other_char):
-        t = s_clean
-        t = t.replace(other_char, "")  # buang ribuan
-        t = t.replace(dec_char, ".")   # ganti desimal ke '.'
-        return t
-
-    if "." in s_clean and "," in s_clean:
-        canon = apply_decimal(".", ",") if last_dot > last_com else apply_decimal(",", ".")
-    elif "," in s_clean:
-        parts = s_clean.split(",")
-        canon = apply_decimal(",", ".") if len(parts[-1]) in (1, 2) else s_clean.replace(",", "")
-    elif "." in s_clean:
-        parts = s_clean.split(".")
-        canon = s_clean if len(parts[-1]) in (1, 2) else s_clean.replace(".", "")
-    else:
-        canon = s_clean
-
-    canon = re.sub(r"[^0-9.\-]", "", canon)
-    if canon.count(".") > 1:
-        head, _, tail = canon.rpartition(".")
-        canon = re.sub(r"\.", "", head) + "." + tail
-
-    try:
-        val = float(canon)
-        if neg:
-            val = -val
-        if is_percent:
-            val = val / 100.0
-        return val
-    except Exception:
-        return None
-
-# Deteksi blok tabel markdown
-_table_block_pat = re.compile(r"(?:^\s*\|.*\|\s*$\n?){2,}", re.M)
-
-def _clean_table_block(block: str) -> str:
-    lines = [ln.strip() for ln in block.strip().splitlines() if ln.strip()]
-    cleaned = []
-    for ln in lines:
-        if ln.startswith("|"): ln = ln[1:]
-        if ln.endswith("|"): ln = ln[:-1]
-        cleaned.append(ln)
-    return "\n".join(cleaned)
-
-def _read_markdown_table_to_df(block: str) -> Optional[pd.DataFrame]:
-    cleaned = _clean_table_block(block)
-    lines = cleaned.splitlines()
-    try:
-        tsv = "\n".join(["\t".join([c.strip() for c in ln.split("|")]) for ln in lines])
-        df = pd.read_csv(io.StringIO(tsv), sep="\t", header=0, engine="python")
-        # hilangkan baris alignment --- jika ada
-        if df.shape[0] > 0 and df.iloc[0].astype(str).str.match(r"^:?-{2,}:?$").all():
-            df = df.iloc[1:].reset_index(drop=True)
-        df.columns = [str(c).strip() for c in df.columns]
-        df = df.applymap(lambda x: str(x).strip())
-        df = df.loc[:, (df != "").any(axis=0)]
-        if df.empty:
-            return None
-        return df
-    except Exception:
-        return None
-
-def extract_tables_from_markdown(md_text: str) -> List[pd.DataFrame]:
-    tables = []
-    for m in _table_block_pat.finditer(md_text or ""):
-        block = m.group(0)
-        df = _read_markdown_table_to_df(block)
-        if df is not None and not df.empty:
-            tables.append(df)
-    return tables
-
-def df_to_numeric_values(df: pd.DataFrame, col_whitelist: Optional[List[str]] = None) -> List[float]:
-    nums: List[float] = []
-    # jika tidak ada whitelist dari query, gunakan whitelist default kolom skor
-    if col_whitelist:
-        cols = [c for c in df.columns if re.sub(r"\s+"," ",str(c).strip().lower()) in set(col_whitelist)]
-    else:
-        cols = [c for c in df.columns if re.sub(r"\s+"," ",str(c).strip().lower()) in LIKELY_SCORE_COLS]
-        if not cols:
-            cols = list(df.columns)
-
-    for col in cols:
-        # skip kolom yang mayoritas terlihat seperti ID/HP
-        sample = df[col].astype(str).head(20).tolist()
-        id_like = sum(looks_like_id_or_phone(x) for x in sample)
-        if id_like >= max(5, int(0.4*len(sample))):  # ≥40% sample terlihat ID
-            continue
-
-        series = df[col].apply(_parse_number)
-        series = series[pd.notnull(series)]
-        if not series.empty:
-            nums.extend(series.astype(float).tolist())
-    return nums
-
-def extract_numbers_from_text_as_chart(md_text: str) -> List[float]:
-    numbers: List[float] = []
-    # "label: number" atau "label - number"
-    for ln in (md_text or "").splitlines():
-        m = re.search(r"[:\-]\s*([\-]?\d[\d\.,]*%?)\s*$", ln)
-        if m:
-            raw = m.group(1)
-            if looks_like_id_or_phone(raw):
-                continue
-            val = _parse_number(raw)
-            if val is not None:
-                numbers.append(val)
-    # deret angka dipisah spasi/koma/titik koma (>=3 angka)
-    for m in re.finditer(r"(?:^|\n)\s*(?:[\-]?\d[\d\.,]*%?\s*[,;\s]\s*){2,}[\-]?\d[\d\.,]*%?", md_text or ""):
-        seq = m.group(0)
-        for num in re.findall(r"[\-]?\d[\d\.,]*%?", seq):
-            if looks_like_id_or_phone(num):
-                continue
-            val = _parse_number(num)
-            if val is not None:
-                numbers.append(val)
-    return numbers
-
-def build_table_and_chart_caches():
-    parsed = []
-    chart_nums = []
-    audit = {
-        "tables_detected": 0,
-        "numbers_from_tables": 0,
-        "numbers_from_text": 0,
-    }
-    if not st.session_state.get("documents"):
-        st.session_state.parsed_tables = parsed
-        st.session_state.chart_numbers = chart_nums
-        st.session_state.parse_audit = audit
-        return
-    for doc in st.session_state.documents:
-        md = doc.get("content") or ""
-        tbs = extract_tables_from_markdown(md)
-        audit["tables_detected"] += len(tbs)
-        for i, df in enumerate(tbs):
-            parsed.append({"doc": doc["name"], "index": i + 1, "df": df})
-            audit["numbers_from_tables"] += sum(pd.notnull(df.applymap(_parse_number)).sum())
-        nums = extract_numbers_from_text_as_chart(md)
-        if nums:
-            for v in nums:
-                chart_nums.append({"doc": doc["name"], "value": v})
-            audit["numbers_from_text"] += len(nums)
-    st.session_state.parsed_tables = parsed
-    st.session_state.chart_numbers = chart_nums
-    st.session_state.parse_audit = audit
-
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s).strip().lower())
-
-def filter_values_scope(doc_hint: Optional[str], col_hint: Optional[str]) -> List[float]:
-    values: List[float] = []
-
-    col_whitelist = None
-    if col_hint:
-        col_whitelist = {_norm(col_hint)}
-
-    def match_doc(name: str) -> bool:
-        if not doc_hint or _norm(doc_hint) in {"semua", "semua dokumen", "all", "all documents", "kedua", "dua dokumen", "keduanya", "both"}:
-            return True
-        return _norm(doc_hint) in _norm(name)
-
-    for item in st.session_state.get("parsed_tables", []):
-        if match_doc(item["doc"]):
-            if col_whitelist is None:
-                vals = df_to_numeric_values(item["df"], None)
-            else:
-                allow = [c for c in item["df"].columns if _norm(c) in col_whitelist]
-                vals = df_to_numeric_values(item["df"], [_norm(c) for c in allow]) if allow else df_to_numeric_values(item["df"], None)
-            values.extend(vals)
-
-    for obj in st.session_state.get("chart_numbers", []):
-        if match_doc(obj["doc"]):
-            try:
-                v = float(obj["value"])
-                values.append(v)
-            except Exception:
-                pass
-
-    return values
-
-def apply_range_filter(values: List[float]) -> List[float]:
-    use_range = st.session_state.get("use_range", True)
-    vmin = st.session_state.get("min_val", 0.0)
-    vmax = st.session_state.get("max_val", 100.0)
-    if use_range and vmin is not None and vmax is not None:
-        return [v for v in values if isinstance(v, (int,float)) and vmin <= v <= vmax]
-    return [v for v in values if isinstance(v, (int,float))]
-
-def detect_numeric_intent(q: str) -> Optional[Dict[str, Optional[str]]]:
-    if not q:
-        return None
-    ql = q.lower()
-
-    if not any(k in ql for k in ["tabel", "table", "grafik", "chart", "plot", "data"]):
-        return None
-
-    op = None
-    if any(k in ql for k in ["rata-rata", "rata rata", "average", "mean"]): op = "mean"
-    elif any(k in ql for k in ["jumlah", "total", "sum", "akumulasi"]): op = "sum"
-    elif "median" in ql: op = "median"
-    elif any(k in ql for k in ["min", "minimum", "terkecil"]): op = "min"
-    elif any(k in ql for k in ["max", "maks", "maksimum", "terbesar"]): op = "max"
-    elif any(k in ql for k in ["std", "stdev", "deviasi"]): op = "std"
-    elif any(k in ql for k in ["hitung", "berapa banyak", "count"]): op = "count"
-    else:
-        if any(k in ql for k in ["nilai", "angka", "skor"]):
-            op = "mean"
-
-    if not op:
-        return None
-
-    doc_hint = None
-    mdoc = re.search(r"dokumen\s+([^\.,;:\n]+)", ql)
-    if mdoc:
-        doc_hint = mdoc.group(1).strip()
-    if any(k in ql for k in ["kedua dokumen", "kedua", "keduanya", "dua dokumen", "both documents", "both"]):
-        doc_hint = "kedua"
-    if any(k in ql for k in ["semua dokumen", "semua", "all documents"]):
-        doc_hint = "semua"
-
-    col_hint = None
-    mcol = re.search(r"kolom\s+([^\.,;:\n]+)", ql)
-    if mcol:
-        col_hint = mcol.group(1).strip()
-
-    return {"op": op, "doc_hint": doc_hint, "col_hint": col_hint}
-
-def aggregate_numbers_from_all_tables_and_charts(op: str, doc_hint: Optional[str], col_hint: Optional[str]) -> Tuple[Optional[float], int]:
-    values = filter_values_scope(doc_hint, col_hint)
-    values = apply_range_filter(values)
-    if not values:
-        return None, 0
-    s = pd.Series(values, dtype=float)
-    op = op.lower()
-    if op in {"avg", "average", "mean", "rata", "rata-rata"}:
-        return float(s.mean()), len(values)
-    if op in {"sum", "jumlah", "total"}:
-        return float(s.sum()), len(values)
-    if op in {"median"}:
-        return float(s.median()), len(values)
-    if op in {"min", "minimum", "terkecil"}:
-        return float(s.min()), len(values)
-    if op in {"max", "maksimum", "terbesar", "maks"}:
-        return float(s.max()), len(values)
-    if op in {"std", "stdev", "deviasi", "stddev"}:
-        return float(s.std(ddof=1)), len(values)
-    if op in {"count", "hitung", "berapa banyak"}:
-        return int(s.count()), len(values)
-    return float(s.mean()), len(values)
-
-
-# --------------------- API Fallback & Q&A ---------------------
-def generate_with_mistral_fallback(prompt: str) -> str:
-    if not mistral_client:
-        return "Error: No Mistral API key configured for fallback."
-    try:
-        response = mistral_client.chat(
-            model="mistral-large-latest",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"Error with Mistral fallback: {e}"
-
 def generate_response(context: str, query: str) -> str:
     if not context or len(context) < 10:
-        if "image_bytes" in st.session_state and isinstance(st.session_state.image_bytes, dict):
-            for img_name, img_bytes in st.session_state.image_bytes.items():
-                if any(word.lower() in img_name.lower() for word in query.lower().split()):
-                    return answer_from_image(img_bytes, query)
+        if "image_bytes" in st.session_state and isinstance(st.session_state.image_bytes, dict) and st.session_state.image_bytes:
             first_img = next(iter(st.session_state.image_bytes.values()))
             return answer_from_image(first_img, query)
-        elif "image_bytes" in st.session_state:
-            return answer_from_image(st.session_state.image_bytes, query)
-        return "Error: Document context is empty or too short."
-    
     try:
         retrieved_chunks = _retrieve_top_k(query, k=5)
         if retrieved_chunks:
@@ -704,34 +696,20 @@ Respond in English concisely. If the answer is not in the context, say so. If th
     except Exception as e:
         return f"Error generating response: {e}"
 
-def generate_response_with_fallback(context: str, query: str) -> str:
-    # Intersep pertanyaan numerik
-    intent = detect_numeric_intent(query)
-    if intent:
-        if "parsed_tables" not in st.session_state:
-            build_table_and_chart_caches()
-        val, n = aggregate_numbers_from_all_tables_and_charts(
-            intent["op"], intent["doc_hint"], intent["col_hint"]
+# --------------------- API Fallback & Caching ---------------------
+def generate_with_mistral_fallback(prompt: str) -> str:
+    if not mistral_client:
+        return "Error: No Mistral API key configured for fallback."
+    try:
+        response = mistral_client.chat(
+            model="mistral-large-latest",
+            messages=[{"role": "user", "content": prompt}]
         )
-        scope_txt = "semua dokumen"
-        if intent and intent.get("doc_hint"):
-            dh = intent["doc_hint"]
-            if dh in {"semua", "all", "all documents"}:
-                scope_txt = "semua dokumen"
-            elif dh in {"kedua", "both"}:
-                scope_txt = "kedua dokumen"
-            else:
-                scope_txt = f"dokumen yang cocok '{dh}'"
-        col_txt = f", kolom '{intent['col_hint']}'" if intent and intent.get("col_hint") else ""
-        if val is not None and n > 0:
-            if ANSWER_LANGUAGE == "Bahasa Indonesia":
-                return f"Hasil **{intent['op']}** dari angka pada **tabel/grafik** ({scope_txt}{col_txt}) adalah **{val:,.4f}** berdasarkan {n} nilai."
-            else:
-                return f"The **{intent['op']}** across numbers in **tables/charts** ({scope_txt}{col_txt}) is **{val:,.4f}** based on {n} values."
-        else:
-            return "Tidak ditemukan angka yang sesuai filter. Coba nonaktifkan filter rentang di sidebar atau perjelas dokumen/kolomnya."
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error with Mistral fallback: {e}"
 
-    # bukan numerik → LLM
+def generate_response_with_fallback(context: str, query: str) -> str:
     try:
         return generate_response(context, query)
     except Exception as e:
@@ -763,7 +741,6 @@ Respond in English concisely. If the answer is not in the context, say so.
         else:
             return f"Error generating response: {e}"
 
-
 # --------------------- Document Management Helpers ---------------------
 def clear_all_document_state():
     st.session_state.documents = []
@@ -773,24 +750,17 @@ def clear_all_document_state():
     st.session_state.retrieval_norms = None
     st.session_state.image_bytes = {}
     st.session_state.chat_history = []
-    st.session_state.parsed_tables = []
-    st.session_state.chart_numbers = []
-    st.session_state.parse_audit = {}
 
 def rebuild_document_content():
     if st.session_state.documents:
         all_content = [f"--- DOCUMENT: {d['name']} ---\n{d['content']}" for d in st.session_state.documents]
         st.session_state.ocr_content = "\n\n".join(all_content)
         _build_retrieval_index(st.session_state.ocr_content)
-        build_table_and_chart_caches()
     else:
         st.session_state.ocr_content = None
         st.session_state.retrieval_chunks = None
         st.session_state.retrieval_embeddings = None
         st.session_state.retrieval_norms = None
-        st.session_state.parsed_tables = []
-        st.session_state.chart_numbers = []
-        st.session_state.parse_audit = {}
 
 
 # ======================= DASHBOARD HELPERS =======================
@@ -816,7 +786,7 @@ def _compute_ocr_quality(text: str) -> float:
     if not text: return 0.0
     n = len(text)
     good = sum(ch.isalnum() or ch.isspace() or ch in ".,:;-%()[]|/+\n" for ch in text)
-    bad = text.count("�")
+    bad = text.count(" ")
     short_lines = sum(1 for ln in text.splitlines() if 0 < len(ln.strip()) < 3)
     score = (good / n) * 100.0
     score -= min(25, bad * 0.5)
@@ -827,7 +797,7 @@ def _structure_stats(md_text: str) -> dict:
     if not md_text:
         return {"text": 0, "tables": 0, "images": 0}
     lines = md_text.splitlines()
-    table_lines = sum(1 for ln in lines if ln.strip().startswith("|") and ln.count("|") >= 2)
+    table_lines = sum(1 for ln in lines if "<table" in md_text or (ln.strip().startswith("|") and ln.count("|") >= 2))
     image_tags = md_text.count("![") + md_text.lower().count("<img")
     text_chars = len(md_text)
     return {"text": text_chars, "tables": table_lines, "images": image_tags}
@@ -872,6 +842,1090 @@ def _is_financial_report(text: str) -> bool:
     t = text.lower()
     return any(k in t for k in keys)
 
+_num_pat = re.compile(r"([\-]?\d{1,3}(?:[\.,]\d{3})*(?:[\.,]\d{1,2})?)")
+
+def _parse_number(s: str):
+    s = s.strip()
+    if not s: return None
+    if "." in s and "," in s:
+        if s.find(".") < s.find(","):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    else:
+        if "," in s and "." not in s:
+            s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        digits = re.sub(r"[^\d\-\.]", "", s)
+        try:
+            return float(digits)
+        except Exception:
+            return None
+
+def _extract_financials(text: str):
+    rev = {}
+    prof = {}
+    gross = {}
+    op = {}
+    net = {}
+    assets = equity = curr_assets = curr_liab = debt = None
+
+    lines = text.splitlines()
+    for ln in lines:
+        years = re.findall(r"\b(20\d{2}|19\d{2})\b", ln)
+        if not years:
+            continue
+        y = int(years[0])
+
+        if re.search(r"\b(revenue|pendapatan|penjualan)\b", ln, re.I):
+            m = _num_pat.search(ln)
+            if m:
+                val = _parse_number(m.group(1))
+                if val is not None:
+                    rev[y] = val
+        if re.search(r"\b(net income|laba bersih|laba/rugi bersih|profit|laba)\b", ln, re.I):
+            m = _num_pat.search(ln)
+            if m:
+                val = _parse_number(m.group(1))
+                if val is not None:
+                    prof[y] = val
+        if re.search(r"\b(gross profit|laba kotor)\b", ln, re.I):
+            m = _num_pat.search(ln)
+            if m:
+                val = _parse_number(m.group(1))
+                if val is not None:
+                    gross[y] = val
+        if re.search(r"\b(operating profit|laba usaha|laba operasi)\b", ln, re.I):
+            m = _num_pat.search(ln)
+            if m:
+                val = _parse_number(m.group(1))
+                if val is not None:
+                    op[y] = val
+        if re.search(r"\b(net profit|net income|laba bersih)\b", ln, re.I):
+            m = _num_pat.search(ln)
+            if m:
+                val = _parse_number(m.group(1))
+                if val is not None:
+                    net[y] = val
+
+        if assets is None and re.search(r"\b(total assets|jumlah aset)\b", ln, re.I):
+            m = _num_pat.search(ln); assets = _parse_number(m.group(1)) if m else None
+        if equity is None and re.search(r"\b(total equity|ekuitas)\b", ln, re.I):
+            m = _num_pat.search(ln); equity = _parse_number(m.group(1)) if m else None
+        if curr_assets is None and re.search(r"\b(current assets|aset lancar)\b", ln, re.I):
+            m = _num_pat.search(ln); curr_assets = _parse_number(m.group(1)) if m else None
+        if curr_liab is None and re.search(r"\b(current liab|liabilitas lancar|utang lancar)\b", ln, re.I):
+            m = _num_pat.search(ln); curr_liab = _parse_number(m.group(1)) if m else None
+        if debt is None and re.search(r"\b(total debt|utang|pinjaman)\b", ln, re.I):
+            m = _num_pat.search(ln); debt = _parse_number(m.group(1)) if m else None
+
+    return {
+        "revenue_by_year": dict(sorted(rev.items())),
+        "profit_by_year": dict(sorted(prof.items())),
+        "gross_by_year": dict(sorted(gross.items())),
+        "operating_by_year": dict(sorted(op.items())),
+        "net_by_year": dict(sorted(net.items())),
+        "assets": assets, "equity": equity,
+        "current_assets": curr_assets, "current_liabilities": curr_liab, "debt": debt
+    }
+
+def _yoy_growth(series: dict) -> dict:
+    ys = sorted(series.keys())
+    growth = {}
+    for i in range(1, len(ys)):
+        y0, y1 = ys[i-1], ys[i]
+        if series[y0] and series[y0] != 0:
+            growth[y1] = (series[y1] - series[y0]) / abs(series[y0]) * 100.0
+    return growth
+
+def _readability_from_avg_sentence_len(text: str):
+    if not text: return 0.0, 0.0
+    sents = re.split(r"[.!?\n]+", text)
+    sents = [s.strip() for s in sents if s.strip()]
+    if not sents: return 0.0, 0.0
+    words = sum(len(s.split()) for s in sents)
+    avg = words / len(sents)
+    score = 100.0 - ((avg - 8) / (40 - 8)) * 100.0
+    score = max(0.0, min(100.0, score))
+    return avg, score
+
+def _ner_counts_with_gemini(text: str):
+    if not google_api_key:
+        return None
+    try:
+        prompt = """
+Extract counts of named entities by coarse type from the text.
+Only return a compact JSON like {"ORG": 12, "PERSON": 5, "LOC": 7}. Types limited to ORG, PERSON, LOC.
+If none detected, use 0.
+Text:
+""" + _truncate_context(text, 20000)
+        raw = _generate_with_fallback(prompt)
+        data = json.loads(re.findall(r"\{.*\}", raw, re.S)[0])
+        return {"ORG": int(data.get("ORG", 0)), "PERSON": int(data.get("PERSON", 0)), "LOC": int(data.get("LOC", 0))}
+    except Exception:
+        return None
+
+def _ner_counts_naive(text: str):
+    ORG = len(re.findall(r"\b(PT|Tbk|Persero|Inc\.?|Ltd\.?|LLC|Corp\.?)\b", text))
+    PERSON = len(re.findall(r"\b[A-Z][a-z]+ [A-Z][a-z]+(?: [A-Z][a-z]+)?\b", text))
+    LOC = len(re.findall(r"\b(Jakarta|Bandung|Surabaya|Medan|Indonesia|Singapore|Malaysia|USA|Europe|Asia)\b", text))
+    return {"ORG": ORG, "PERSON": PERSON, "LOC": LOC}
+
+
+# ======================= TABLE PARSER & AVG INTENT =======================
+_TABLE_ROW_RE = re.compile(r'^\s*\|(.+)\|\s*$')
+_TABLE_SEP_RE = re.compile(r'^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$')
+
+def _parse_markdown_tables(md_text: str) -> list:
+    """
+    Mengembalikan list of (DataFrame, meta) dari tabel Markdown di teks.
+    Meta: {"doc_section": str, "table_index": int}
+    Mencoba infer header saat tidak ada header eksplisit.
+    """
+    tables = []
+    lines = md_text.splitlines()
+    buf = []
+
+    def _flush(buf_lines, t_idx):
+        if not buf_lines:
+            return
+        rows = []
+        for ln in buf_lines:
+            m = _TABLE_ROW_RE.match(ln)
+            if not m:
+                continue
+            cells = [c.strip() for c in m.group(1).split('|')]
+            rows.append(cells)
+
+        if not rows:
+            return
+
+        header = None
+        if len(rows) >= 2 and _TABLE_SEP_RE.match(buf_lines[1]):  # header | sep | data...
+            header = [h if h else f"col_{i+1}" for i, h in enumerate(rows[0])]
+            data = rows[2:] if len(rows) > 2 else []
+        else:
+            first = rows[0]
+            nonnum = sum(1 for x in first if not re.fullmatch(r'[-+]?\d+([.,]\d+)?', (x or '')))
+            if nonnum >= max(1, len(first) // 2):
+                header = [h if h else f"col_{i+1}" for i, h in enumerate(first)]
+                data = rows[1:]
+            else:
+                ncol = len(first)
+                header = [f"col_{i+1}" for i in range(ncol)]
+                data = rows
+
+        maxc = len(header)
+        norm_rows = []
+        for r in data:
+            if len(r) < maxc:
+                r = r + [''] * (maxc - len(r))
+            elif len(r) > maxc:
+                r = r[:maxc]
+            norm_rows.append(r)
+
+        try:
+            df = pd.DataFrame(norm_rows, columns=header)
+            tables.append((df, {"doc_section": "All", "table_index": t_idx, "source": "md"}))
+        except Exception:
+            pass
+
+    t_idx = 0
+    for ln in lines:
+        if _TABLE_ROW_RE.match(ln):
+            buf.append(ln)
+        else:
+            if buf:
+                _flush(buf, t_idx)
+                t_idx += 1
+                buf = []
+    if buf:
+        _flush(buf, t_idx)
+
+    return tables
+
+# === NEW: parser tabel HTML (hasil DOCX) ===
+def _parse_html_tables(html_text: str) -> list:
+    """
+    Parse <table> HTML (hasil DOCX) menjadi list of (DataFrame, meta).
+    Prioritas: pandas.read_html; fallback BeautifulSoup jika perlu.
+    """
+    tables = []
+    if not html_text or "<table" not in html_text.lower():
+        return tables
+
+    # 1) Coba langsung dengan pandas
+    try:
+        dfs = pd.read_html(html_text)  # type: ignore
+        for i, df in enumerate(dfs):
+            cols = [str(c) if str(c).strip() else f"col_{j+1}" for j, c in enumerate(df.columns)]
+            df.columns = cols
+            tables.append((df, {"doc_section": "All", "table_index": i, "source": "html"}))
+        if tables:
+            return tables
+    except Exception:
+        pass
+
+    # 2) Fallback ringan pakai BeautifulSoup
+    try:
+        from bs4 import BeautifulSoup  # pip install beautifulsoup4
+        soup = BeautifulSoup(html_text, "html.parser")
+        for i, tbl in enumerate(soup.find_all("table")):
+            rows = []
+            for tr in tbl.find_all("tr"):
+                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+                if cells:
+                    rows.append(cells)
+            if not rows:
+                continue
+            maxc = max(len(r) for r in rows)
+            norm = [r + [""]*(maxc-len(r)) for r in rows]
+            first_tr = tbl.find_all("tr")[0] if tbl.find_all("tr") else None
+            use_header = first_tr and all(x.name == "th" for x in first_tr.find_all(["th","td"]))
+            if use_header:
+                header, data = norm[0], norm[1:]
+            else:
+                header = [f"col_{j+1}" for j in range(maxc)]
+                data = norm
+            df = pd.DataFrame(data, columns=header)
+            tables.append((df, {"doc_section": "All", "table_index": i, "source": "html"}))
+    except Exception:
+        pass
+
+    return tables
+
+def _is_avg_intent(q: str) -> bool:
+    ql = q.lower()
+    keys = ["rata rata", "rata-rata", "average", "avg", "mean"]
+    return any(k in ql for k in keys)
+
+def _is_visualization_intent(q: str) -> bool:
+    """Detect if user wants a visualization/chart."""
+    ql = q.lower()
+    viz_keywords = [
+        "grafik", "chart", "visualisasi", "visualization", "plot", "diagram", 
+        "bar chart", "line chart", "pie chart", "histogram", "scatter plot",
+        "tampilkan grafik", "buat grafik", "show chart", "create chart",
+        "gambar grafik", "draw chart", "plot data", "visualize data"
+    ]
+    return any(keyword in ql for keyword in viz_keywords)
+
+def _extract_target_column_terms(q: str) -> list:
+    quoted = re.findall(r'[""](.+?)[""]', q)
+    terms = [t.strip() for t in quoted if t.strip()]
+    m = re.search(r'\b(kolom|column|field)\s+([A-Za-z0-9_\-\s]+)', q, re.I)
+    if m:
+        chunk = m.group(2).strip()
+        chunk = re.split(r'[,.;:?]|rata|average|mean', chunk, 1)[0].strip()
+        if chunk:
+            terms.append(chunk)
+    toks = _tokenize(q)
+    toks = [t for t in toks if t not in {"rata", "rata-rata", "average", "mean", "avg", "nilai", "value"}]
+    if toks:
+        terms.append(max(toks, key=len))
+    seen = set(); res = []
+    for t in terms:
+        tt = t.lower()
+        if tt not in seen:
+            seen.add(tt); res.append(t)
+    return res[:3]
+
+def _normalize_col(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r'\s+', ' ', s)
+    s = s.replace('_', ' ')
+    return s
+
+def _guess_best_column(df: pd.DataFrame, query: str) -> str | None:
+    if df.empty or df.shape[1] == 0:
+        return None
+    colmap = {c: _normalize_col(c) for c in df.columns}
+    terms = _extract_target_column_terms(query)
+    synonyms = {
+        "harga": ["price", "amount", "nilai", "nominal", "jumlah"],
+        "pendapatan": ["revenue", "sales", "omzet"],
+        "laba": ["profit", "net profit", "laba bersih", "income"],
+        "tanggal": ["date", "periode", "period", "bulan", "month", "year", "tahun"],
+        "qty": ["quantity", "jumlah", "kuantitas", "volume"],
+        # penting untuk kasus nilai mahasiswa
+        "nilai": ["score", "skor", "uts", "uas", "nilai uts", "nilai uas", "nilai uts/uas", "nilai ujian"],
+    }
+    candidates = []
+    for t in terms:
+        nt = _normalize_col(t)
+        for orig, norm in colmap.items():
+            if nt == norm or nt in norm or norm in nt:
+                candidates.append(orig)
+        close = difflib.get_close_matches(nt, list(colmap.values()), n=1, cutoff=0.75)
+        if close:
+            for orig, norm in colmap.items():
+                if norm == close[0]:
+                    candidates.append(orig)
+        for base, syns in synonyms.items():
+            if nt == base or nt in syns:
+                close2 = difflib.get_close_matches(base, list(colmap.values()), n=1, cutoff=0.6)
+                if close2:
+                    for orig, norm in colmap.items():
+                        if norm == close2[0]:
+                            candidates.append(orig)
+    for c in candidates:
+        s = pd.to_numeric(
+            df[c].astype(str)
+                .str.replace(r'[^\d\-\.,]', '', regex=True)
+                .str.replace('.', '', regex=False)
+                .str.replace(',', '.', regex=False),
+            errors='coerce'
+        )
+        if s.notna().sum() >= max(2, int(len(s)*0.5)):
+            return c
+    best_col = None; best_score = -1
+    for c in df.columns:
+        s = pd.to_numeric(
+            df[c].astype(str)
+                .str.replace(r'[^\d\-\.,]', '', regex=True)
+                .str.replace('.', '', regex=False)
+                .str.replace(',', '.', regex=False),
+            errors='coerce'
+        )
+        score = s.notna().sum()
+        if score > best_score:
+            best_score = score; best_col = c
+    return best_col
+
+# --------- Fallback parser nilai dari teks polos ---------
+def _to_float_id_en(num: str) -> float | None:
+    if not num:
+        return None
+    s = num.strip()
+    if "." in s and "," in s:
+        if s.find(".") < s.find(","):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    else:
+        if "," in s and "." not in s:
+            s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        try:
+            digits = re.sub(r"[^\d\.\-]", "", s)
+            return float(digits) if digits else None
+        except Exception:
+            return None
+
+def _extract_scores_from_text(text: str) -> list[float]:
+    scores: list[float] = []
+    t = " ".join(text.split())
+    p_phone = re.compile(r'(\d{1,3}(?:[.,]\d{1,2})?)\s+(0\d{9,13})')
+    for m in p_phone.finditer(t):
+        val = _to_float_id_en(m.group(1))
+        if val is not None and 0 <= val <= 100:
+            scores.append(val)
+    p_rank = re.compile(
+        r'\b\d{1,3}\s+(?:\d{8,12})\s+[A-Za-zÀ-ÿ\.\'\- ]{2,}?'
+        r'\s+(\d{1,3}(?:[.,]\d{1,2})?)\b'
+    )
+    for m in p_rank.finditer(t):
+        val = _to_float_id_en(m.group(1))
+        if val is not None and 0 <= val <= 100:
+            scores.append(val)
+    if not scores:
+        near = []
+        for m in re.finditer(r'(nilai[^0-9]{0,30})(\d{1,3}(?:[.,]\d{1,2})?)', t, flags=re.I):
+            val = _to_float_id_en(m.group(2))
+            if val is not None and 0 <= val <= 100:
+                near.append(val)
+        if len(near) >= 3:
+            scores.extend(near)
+    if scores:
+        seen = set(); uniq = []
+        for v in scores:
+            key = round(v, 2)
+            if key not in seen:
+                seen.add(key); uniq.append(v)
+        scores = uniq
+    return scores
+
+# ========== BARU: pilih dokumen berdasar pertanyaan ==========
+def _normalize_filename(name: str) -> str:
+    base = os.path.splitext(name)[0]
+    base = re.sub(r'[^a-zA-Z0-9]+', ' ', base).strip().lower()
+    return base
+
+def select_docs_for_query(query: str, documents: list) -> list:
+    q = query.lower()
+    matches = []
+    for d in documents:
+        norm = _normalize_filename(d["name"])
+        if norm and norm in q:
+            matches.append(d)
+        else:
+            tokens = [t for t in norm.split() if len(t) > 2]
+            hit = sum(1 for t in tokens if t in q)
+            if hit >= max(1, len(tokens)//2):
+                matches.append(d)
+    if len(matches) == 1:
+        return matches
+    if len(matches) >= 2:
+        return matches
+    return documents
+
+# ========== MODIFIED: hitung rata-rata per dokumen (HTML + Markdown) ==========
+def compute_average_per_doc(query: str, documents: list) -> list[dict]:
+    if not _is_avg_intent(query):
+        return []
+
+    results = []
+    for doc in documents:
+        content = doc.get("content") or ""
+        tables = []
+
+        # DOCX → HTML tables
+        if "<table" in content.lower():
+            tables += _parse_html_tables(content)
+
+        # PDF/Markdown tables
+        tables += _parse_markdown_tables(content)
+
+        best = None
+
+        for df, meta in tables:
+            if df.empty:
+                continue
+            col = _guess_best_column(df, query)
+            if not col:
+                continue
+            s = pd.to_numeric(
+                df[col].astype(str)
+                    .str.replace(r'[^\d\-\.,]', '', regex=True)
+                    .str.replace('.', '', regex=False)   # ribuan → buang titik
+                    .str.replace(',', '.', regex=False),  # desimal id → '.'
+                errors='coerce'
+            )
+            vals = s.dropna()
+            # singkirkan angka tidak masuk akal (mis. no. telepon)
+            vals = vals[(vals >= 0) & (vals <= 100)]
+            if len(vals) == 0:
+                continue
+
+            mean_val = float(vals.mean())
+            cand = {"doc": doc["name"], "column": col, "value": mean_val, "n": int(len(vals))}
+            if (best is None) or (cand["n"] > best["n"]):
+                best = cand
+
+        # Fallback teks polos tetap ada
+        if (best is None) or best["n"] < 3:
+            scores = _extract_scores_from_text(content)
+            if len(scores) >= 3:
+                mean_val = float(np.mean(scores))
+                best = {"doc": doc["name"], "column": "Nilai (fallback)", "value": mean_val, "n": int(len(scores))}
+
+        if best:
+            results.append(best)
+
+    return results
+
+def generate_visualization(query: str, documents: list) -> tuple[bool, str, any]:
+    """
+    Generate visualization based on user query and document data.
+    Returns: (success, message, chart_object)
+    """
+    if not _is_visualization_intent(query):
+        return False, "", None
+    
+    try:
+        # Debug info
+        st.info(f"🔍 Processing visualization request: {query}")
+        st.info(f"📚 Found {len(documents)} documents")
+        
+        # Extract all tables from documents
+        all_tables = []
+        for doc in documents:
+            content = doc.get("content") or ""
+            
+            # DOCX → HTML tables
+            if "<table" in content.lower():
+                html_tables = _parse_html_tables(content)
+                all_tables.extend(html_tables)
+                st.info(f"📊 Found {len(html_tables)} HTML tables in {doc.get('name', 'Unknown')}")
+            
+            # PDF/Markdown tables
+            md_tables = _parse_markdown_tables(content)
+            all_tables.extend(md_tables)
+            st.info(f"📊 Found {len(md_tables)} Markdown tables in {doc.get('name', 'Unknown')}")
+        
+        if not all_tables:
+            st.warning("⚠️ No tables found in documents to visualize.")
+            return False, "No tables found in documents to visualize.", None
+        
+        st.success(f"✅ Total tables found: {len(all_tables)}")
+        
+        # Find the best table for visualization
+        best_table = None
+        best_score = 0
+        
+        for i, (df, meta) in enumerate(all_tables):
+            if df.empty or df.shape[0] < 2 or df.shape[1] < 2:
+                continue
+            
+            # Score based on data quality
+            numeric_cols = 0
+            text_cols = 0
+            for col in df.columns:
+                try:
+                    # Try to convert to numeric
+                    pd.to_numeric(df[col].astype(str).str.replace(r'[^\d\-\.,]', '', regex=True), errors='coerce')
+                    numeric_cols += 1
+                except:
+                    text_cols += 1
+            
+            score = numeric_cols * 2 + text_cols
+            st.info(f"📈 Table {i+1}: {df.shape[0]} rows × {df.shape[1]} cols, {numeric_cols} numeric, {text_cols} text, score: {score}")
+            
+            if score > best_score:
+                best_score = score
+                best_table = (df, meta)
+        
+        if not best_table:
+            st.warning("⚠️ No suitable table data found for visualization.")
+            return False, "No suitable table data found for visualization.", None
+        
+        df, meta = best_table
+        st.success(f"✅ Selected best table: {df.shape[0]} rows × {df.shape[1]} cols")
+        
+        # Determine chart type based on query
+        ql = query.lower()
+        chart_type = "auto"
+        
+        if any(x in ql for x in ["bar", "bar chart", "grafik batang"]):
+            chart_type = "bar"
+        elif any(x in ql for x in ["line", "line chart", "grafik garis", "trend"]):
+            chart_type = "line"
+        elif any(x in ql for x in ["pie", "pie chart", "grafik lingkaran", "donut"]):
+            chart_type = "pie"
+        elif any(x in ql for x in ["scatter", "scatter plot", "scatterplot", "scatter plot"]):
+            chart_type = "scatter"
+        elif any(x in ql for x in ["histogram", "distribusi", "distribution"]):
+            chart_type = "histogram"
+        
+        st.info(f"🎯 Chart type detected: {chart_type}")
+        
+        # Generate appropriate chart
+        chart = _create_chart(df, chart_type, query, documents)
+        
+        if chart:
+            st.success(f"✅ Successfully generated {chart_type} chart!")
+            return True, f"Generated {chart_type} chart from {meta.get('doc_section', 'document')} data.", chart
+        else:
+            st.error(f"❌ Failed to generate {chart_type} chart.")
+            return False, "Failed to generate chart. Please try with different data or chart type.", None
+            
+    except Exception as e:
+        st.error(f"❌ Error generating visualization: {str(e)}")
+        import traceback
+        st.error(f"Traceback: {traceback.format_exc()}")
+        return False, f"Error generating visualization: {str(e)}", None
+
+def _create_document_comparison_data(query: str, documents: list) -> pd.DataFrame:
+    """Create aggregated data for document comparison in pie charts."""
+    try:
+        if not documents or len(documents) < 2:
+            return None
+            
+        comparison_data = []
+        
+        for doc in documents:
+            try:
+                doc_name = doc.get("name", "Unknown")
+                content = doc.get("content", "")
+                
+                # Count rows in tables or estimate from content
+                table_count = 0
+                
+                # Method 1: Count table rows from HTML
+                if "<table" in content.lower():
+                    # Count table rows more accurately
+                    table_rows = content.lower().count("<tr>")
+                    table_headers = content.lower().count("<th>")
+                    table_count = max(1, table_rows - table_headers)  # Subtract header rows
+                
+                # Method 2: Count from markdown tables
+                elif "|" in content:
+                    lines = content.split('\n')
+                    table_lines = [line for line in lines if '|' in line and line.strip()]
+                    # Remove separator lines (like |---|---|)
+                    separator_lines = [line for line in table_lines if re.match(r'^\s*\|[\s\-:]+\|\s*$', line)]
+                    table_count = max(1, len(table_lines) - len(separator_lines))
+                
+                # Method 3: Estimate from content length and structure
+                else:
+                    lines = content.split('\n')
+                    # Look for patterns that suggest data rows
+                    data_lines = [line for line in lines if len(line.strip()) > 10 and 
+                                (re.search(r'\d+', line) or re.search(r'[A-Za-z]+\s+[A-Za-z]+', line))]
+                    table_count = max(1, len(data_lines))
+                
+                # Ensure we have a reasonable count
+                if table_count <= 0:
+                    table_count = 1
+                
+                comparison_data.append({
+                    'document': doc_name,
+                    'count': table_count
+                })
+                
+            except Exception as e:
+                # If individual document processing fails, continue with others
+                st.warning(f"Warning: Could not process document {doc.get('name', 'Unknown')}: {str(e)}")
+                continue
+        
+        if len(comparison_data) >= 2:  # Need at least 2 documents to compare
+            df_result = pd.DataFrame(comparison_data)
+            # Sort by count descending for better visualization
+            df_result = df_result.sort_values('count', ascending=False)
+            return df_result
+        
+        return None
+        
+    except Exception as e:
+        st.error(f"Error creating document comparison data: {str(e)}")
+        return None
+
+def _create_chart(df: pd.DataFrame, chart_type: str, query: str, documents: list) -> any:
+    """Create a specific type of chart from DataFrame."""
+    try:
+        if df.empty or df.shape[0] < 2:
+            return None
+        
+        # Clean and prepare data
+        df_clean = df.copy()
+        
+        # Find numeric columns
+        numeric_cols = []
+        for col in df.columns:
+            try:
+                pd.to_numeric(df_clean[col].astype(str).str.replace(r'[^\d\-\.,]', '', regex=True), errors='coerce')
+                numeric_cols.append(col)
+            except:
+                continue
+        
+        if not numeric_cols:
+            return None
+        
+        # Smart column selection based on query context
+        value_col = _select_best_value_column(df_clean, query, numeric_cols)
+        if not value_col:
+            value_col = numeric_cols[0]  # fallback
+        
+        # Clean numeric data
+        df_clean[value_col] = pd.to_numeric(
+            df_clean[value_col].astype(str)
+                .str.replace(r'[^\d\-\.,]', '', regex=True)
+                .str.replace('.', '', regex=False)
+                .str.replace(',', '.', regex=False),
+            errors='coerce'
+        )
+        
+        # Remove rows with NaN values
+        df_clean = df_clean.dropna(subset=[value_col])
+        
+        if df_clean.empty or len(df_clean) < 2:
+            return None
+        
+        # Limit data points for better visualization
+        if len(df_clean) > 20:
+            df_clean = df_clean.head(20)
+        
+        # Create chart based on type
+        if chart_type == "bar":
+            # Find a good label column
+            label_col = _select_best_label_column(df_clean, query, value_col)
+            
+            if label_col:
+                fig = px.bar(
+                    df_clean, 
+                    x=label_col, 
+                    y=value_col,
+                    title=f"Grafik Batang: {value_col} berdasarkan {label_col}",
+                    labels={value_col: "Nilai", label_col: "Kategori"}
+                )
+            else:
+                # Use index as labels
+                fig = px.bar(
+                    df_clean, 
+                    x=df_clean.index, 
+                    y=value_col,
+                    title=f"Grafik Batang: {value_col}",
+                    labels={value_col: "Nilai", "index": "Index"}
+                )
+        
+        elif chart_type == "line":
+            # Try to find a sequential column (like dates, years, etc.)
+            seq_col = _select_best_sequence_column(df_clean, query, value_col)
+            
+            if seq_col:
+                df_clean[seq_col] = pd.to_numeric(df_clean[seq_col], errors='coerce')
+                df_clean = df_clean.sort_values(seq_col)
+                fig = px.line(
+                    df_clean, 
+                    x=seq_col, 
+                    y=value_col,
+                    title=f"Grafik Garis: {value_col} berdasarkan {seq_col}",
+                    labels={value_col: "Nilai", seq_col: "Urutan"}
+                )
+            else:
+                fig = px.line(
+                    df_clean, 
+                    x=df_clean.index, 
+                    y=value_col,
+                    title=f"Grafik Garis: {value_col}",
+                    labels={value_col: "Nilai", "index": "Index"}
+                )
+        
+        elif chart_type == "pie":
+            # Find a good label column
+            label_col = _select_best_label_column(df_clean, query, value_col)
+            
+            if label_col:
+                fig = px.pie(
+                    df_clean, 
+                    values=value_col, 
+                    names=label_col,
+                    title=f"Grafik Lingkaran: {value_col} berdasarkan {label_col}"
+                )
+            else:
+                # Try to create pie chart for document comparison
+                if "membandingkan" in query.lower() or "vs" in query.lower() or "antara" in query.lower():
+                    try:
+                        # Create aggregated data for document comparison
+                        doc_comparison_data = _create_document_comparison_data(query, documents)
+                        if doc_comparison_data is not None and not doc_comparison_data.empty:
+                            fig = px.pie(
+                                doc_comparison_data,
+                                values='count',
+                                names='document',
+                                title="Grafik Lingkaran: Perbandingan Jumlah Kandidat Antar Dokumen"
+                            )
+                        else:
+                            return None
+                    except Exception as e:
+                        st.error(f"Error creating document comparison pie chart: {str(e)}")
+                        return None
+                else:
+                    # Try to create pie chart from existing data by creating categories
+                    try:
+                        categorized_data = _create_categorized_pie_data(df_clean, value_col, query)
+                        if categorized_data is not None and not categorized_data.empty:
+                            fig = px.pie(
+                                categorized_data,
+                                values='count',
+                                names='category',
+                                title=f"Grafik Lingkaran: Distribusi {value_col} berdasarkan Kategori"
+                            )
+                        else:
+                            return None
+                    except Exception as e:
+                        st.error(f"Error creating categorized pie chart: {str(e)}")
+                        return None
+        
+        elif chart_type == "scatter":
+            # Need two numeric columns
+            if len(numeric_cols) >= 2:
+                x_col = _select_best_x_column(df_clean, query, numeric_cols, value_col)
+                df_clean[x_col] = pd.to_numeric(
+                    df_clean[x_col].astype(str)
+                        .str.replace(r'[^\d\-\.,]', '', regex=True)
+                        .str.replace('.', '', regex=False)
+                        .str.replace(',', '.', regex=False),
+                    errors='coerce'
+                )
+                df_clean = df_clean.dropna(subset=[x_col])
+                
+                if not df_clean.empty and len(df_clean) >= 2:
+                    fig = px.scatter(
+                        df_clean, 
+                        x=x_col, 
+                        y=value_col,
+                        title=f"Scatter Plot: {value_col} vs {x_col}",
+                        labels={value_col: "Nilai Y", x_col: "Nilai X"}
+                    )
+                else:
+                    return None
+            else:
+                return None  # Scatter needs two numeric columns
+        
+        elif chart_type == "histogram":
+            fig = px.histogram(
+                df_clean, 
+                x=value_col,
+                title=f"Histogram: Distribusi {value_col}",
+                labels={value_col: "Nilai"},
+                nbins=min(20, len(df_clean))
+            )
+        
+        else:  # auto - try to pick the best
+            if len(numeric_cols) >= 2:
+                # Try scatter plot
+                chart = _create_chart(df, "scatter", query, documents)
+                if chart:
+                    return chart
+            
+            # Try bar chart
+            chart = _create_chart(df, "bar", query, documents)
+            if chart:
+                return chart
+            
+            # Fallback to histogram
+            return _create_chart(df, "histogram", query, documents)
+        
+        # Update layout for better appearance
+        fig.update_layout(
+            height=500,
+            showlegend=True,
+            margin=dict(l=50, r=50, t=80, b=50),
+            font=dict(size=12),
+            hovermode='closest'
+        )
+        
+        # Add some interactivity
+        fig.update_traces(
+            hovertemplate='<b>%{x}</b><br>Nilai: %{y}<extra></extra>'
+        )
+        
+        return fig
+        
+    except Exception as e:
+        st.error(f"Error creating chart: {str(e)}")
+        return None
+
+def _select_best_value_column(df: pd.DataFrame, query: str, numeric_cols: list) -> str:
+    """Select the best column for values based on query context."""
+    query_lower = query.lower()
+    
+    # Priority keywords for value columns
+    priority_keywords = {
+        'uts': ['uts', 'ujian tengah semester', 'midterm'],
+        'uas': ['uas', 'ujian akhir semester', 'final', 'ujian akhir'],
+        'nilai': ['nilai', 'score', 'skor', 'grade', 'hasil'],
+        'pendapatan': ['pendapatan', 'revenue', 'income', 'penjualan'],
+        'harga': ['harga', 'price', 'cost', 'biaya'],
+        'kuantitas': ['kuantitas', 'quantity', 'jumlah', 'volume']
+    }
+    
+    # Check for specific column names first
+    for col in df.columns:
+        col_lower = col.lower()
+        for keyword_group, keywords in priority_keywords.items():
+            if any(keyword in col_lower for keyword in keywords):
+                if col in numeric_cols:
+                    return col
+    
+    # Check for keywords in query
+    for keyword_group, keywords in priority_keywords.items():
+        if any(keyword in query_lower for keyword in keywords):
+            # Find best matching column
+            for col in numeric_cols:
+                col_lower = col.lower()
+                if any(keyword in col_lower for keyword in keywords):
+                    return col
+    
+    # If no specific match, return first numeric column
+    return numeric_cols[0] if numeric_cols else None
+
+def _select_best_label_column(df: pd.DataFrame, query: str, value_col: str) -> str:
+    """Select the best column for labels based on query context."""
+    query_lower = query.lower()
+    
+    # Priority keywords for label columns
+    label_keywords = {
+        'kandidat': ['kandidat', 'candidate', 'nama', 'name', 'mahasiswa', 'student'],
+        'bulan': ['bulan', 'month', 'periode', 'period'],
+        'kategori': ['kategori', 'category', 'jenis', 'type', 'kelompok']
+    }
+    
+    # Check for specific column names first
+    for col in df.columns:
+        if col == value_col:
+            continue
+        col_lower = col.lower()
+        
+        # Skip numeric columns for labels
+        try:
+            pd.to_numeric(df[col], errors='coerce')
+            continue
+        except:
+            pass
+        
+        # Check if column has reasonable number of unique values
+        unique_count = df[col].nunique()
+        if unique_count > 20:  # Too many unique values
+            continue
+            
+        for keyword_group, keywords in label_keywords.items():
+            if any(keyword in col_lower for keyword in keywords):
+                return col
+    
+    # Check for keywords in query
+    for keyword_group, keywords in label_keywords.items():
+        if any(keyword in query_lower for keyword in keywords):
+            for col in df.columns:
+                if col == value_col:
+                    continue
+                col_lower = col.lower()
+                try:
+                    pd.to_numeric(df[col], errors='coerce')
+                    continue
+                except:
+                    pass
+                if df[col].nunique() <= 20:
+                    return col
+    
+    # Find best non-numeric column with reasonable unique values
+    for col in df.columns:
+        if col == value_col:
+            continue
+        try:
+            pd.to_numeric(df[col], errors='coerce')
+            continue
+        except:
+            pass
+        if df[col].nunique() <= 20:
+            return col
+    
+    return None
+
+def _select_best_sequence_column(df: pd.DataFrame, query: str, value_col: str) -> str:
+    """Select the best column for sequence/x-axis in line charts."""
+    query_lower = query.lower()
+    
+    # Priority keywords for sequence columns
+    sequence_keywords = {
+        'urutan': ['urutan', 'order', 'ranking', 'peringkat', 'rank'],
+        'waktu': ['waktu', 'time', 'tanggal', 'date', 'bulan', 'month', 'tahun', 'year'],
+        'index': ['index', 'nomor', 'number', 'id']
+    }
+    
+    # Check for specific column names first
+    for col in df.columns:
+        if col == value_col:
+            continue
+        col_lower = col.lower()
+        
+        for keyword_group, keywords in sequence_keywords.items():
+            if any(keyword in col_lower for keyword in keywords):
+                try:
+                    pd.to_numeric(df[col], errors='coerce')
+                    return col
+                except:
+                    continue
+    
+    # Check for keywords in query
+    for keyword_group, keywords in sequence_keywords.items():
+        if any(keyword in query_lower for keyword in keywords):
+            for col in df.columns:
+                if col == value_col:
+                    continue
+                try:
+                    pd.to_numeric(df[col], errors='coerce')
+                    return col
+                except:
+                    continue
+    
+    # Return first numeric column that's not the value column
+    for col in df.columns:
+        if col != value_col:
+            try:
+                pd.to_numeric(df[col], errors='coerce')
+                return col
+            except:
+                continue
+    
+    return None
+
+def _select_best_x_column(df: pd.DataFrame, query: str, numeric_cols: list, value_col: str) -> str:
+    """Select the best column for x-axis in scatter plots."""
+    # Return first numeric column that's not the value column
+    for col in numeric_cols:
+        if col != value_col:
+            return col
+    return numeric_cols[0] if len(numeric_cols) > 1 else None
+
+def _create_categorized_pie_data(df: pd.DataFrame, value_col: str, query: str) -> pd.DataFrame:
+    """Create categorized data for pie charts by grouping numeric values into ranges."""
+    try:
+        if df.empty or value_col not in df.columns:
+            return None
+        
+        # Get numeric values
+        values = pd.to_numeric(df[value_col], errors='coerce').dropna()
+        if len(values) < 2:
+            return None
+        
+        # Create categories based on value ranges
+        categories = []
+        counts = []
+        
+        # For scores (0-100), create grade categories
+        if values.max() <= 100 and values.min() >= 0:
+            # Grade categories
+            grade_ranges = [
+                (90, 100, "A (90-100)"),
+                (80, 89, "B (80-89)"),
+                (70, 79, "C (70-79)"),
+                (60, 69, "D (60-69)"),
+                (0, 59, "E (<60)")
+            ]
+            
+            for min_val, max_val, label in grade_ranges:
+                count = len(values[(values >= min_val) & (values <= max_val)])
+                if count > 0:
+                    categories.append(label)
+                    counts.append(count)
+        
+        # For other numeric data, create quartile categories
+        else:
+            try:
+                q25, q50, q75 = values.quantile([0.25, 0.5, 0.75])
+                
+                quartile_ranges = [
+                    (values.min(), q25, f"Q1 ({values.min():.1f}-{q25:.1f})"),
+                    (q25, q50, f"Q2 ({q25:.1f}-{q50:.1f})"),
+                    (q50, q75, f"Q3 ({q50:.1f}-{q75:.1f})"),
+                    (q75, values.max(), f"Q4 ({q75:.1f}-{values.max():.1f})")
+                ]
+                
+                for min_val, max_val, label in quartile_ranges:
+                    count = len(values[(values >= min_val) & (values <= max_val)])
+                    if count > 0:
+                        categories.append(label)
+                        counts.append(count)
+            except Exception:
+                # Fallback: create simple ranges
+                min_val, max_val = values.min(), values.max()
+                range_size = (max_val - min_val) / 4
+                
+                for i in range(4):
+                    start = min_val + (i * range_size)
+                    end = min_val + ((i + 1) * range_size) if i < 3 else max_val
+                    count = len(values[(values >= start) & (values <= end)])
+                    if count > 0:
+                        categories.append(f"Range {i+1} ({start:.1f}-{end:.1f})")
+                        counts.append(count)
+        
+        if len(categories) > 1:  # Need at least 2 categories
+            return pd.DataFrame({
+                'category': categories,
+                'count': counts
+            })
+        
+        return None
+        
+    except Exception as e:
+        st.error(f"Error creating categorized pie data: {str(e)}")
+        return None
 
 # --------------------- UI Layout -----------------------
 col1, col2 = st.columns([1, 1])
@@ -888,26 +1942,24 @@ with col1:
 
     process_button = st.button("Process Documents")
 
-    # init states
     if "documents" not in st.session_state:
         st.session_state.documents = []
     if "ocr_content" not in st.session_state:
         st.session_state.ocr_content = None
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
-    if "parsed_tables" not in st.session_state:
-        st.session_state.parsed_tables = []
-    if "chart_numbers" not in st.session_state:
-        st.session_state.chart_numbers = []
-    if "parse_audit" not in st.session_state:
-        st.session_state.parse_audit = {}
+    if "show_chart_examples" not in st.session_state:
+        st.session_state.show_chart_examples = False
 
     # --------------------- URL processing helper -----------------------
     def process_url_to_content(url: str) -> tuple:
         try:
             r = requests.get(
-                url, timeout=30,
-                headers={"User-Agent": "Mozilla/5.0"},
+                url,
+                timeout=30,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                },
                 allow_redirects=True,
             )
             r.raise_for_status()
@@ -915,28 +1967,58 @@ with col1:
             clean_url = url.split("?")[0]
             ext = os.path.splitext(clean_url)[1].lower()
             data = r.content
+
+            # signature
             is_pdf_sig = data[:4] == b"%PDF"
             is_png_sig = data[:8] == b"\x89PNG\r\n\x1a\n"
             is_jpg_sig = data[:3] == b"\xff\xd8\xff"
+
+            # Detect Office CT
+            is_docx_ct = "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in content_type
+            is_doc_ct = "application/msword" in content_type
+
             chosen_kind = None
             if is_pdf_sig or "pdf" in content_type or ext == ".pdf":
                 chosen_kind = "pdf"
             elif is_png_sig or is_jpg_sig or any(img_ct in content_type for img_ct in ["image/png", "image/jpeg", "image/jpg"]) or ext in [".png", ".jpg", ".jpeg"]:
                 chosen_kind = "image"
+            elif ext == ".docx" or is_docx_ct:
+                chosen_kind = "docx"
+            elif ext == ".doc" or is_doc_ct:
+                chosen_kind = "doc"
+
             if not chosen_kind and content_type.startswith("text/html"):
                 html_text = r.text
-                links = re.findall(r'href=[\"\']([^\"\']+\.(?:pdf|png|jpe?g))(?:[\#\?][^\"\']*)?[\"\']', html_text, flags=re.IGNORECASE)
+                links = re.findall(
+                    r'href=["\']([^"\']+\.(?:pdf|png|jpe?g|docx?|DOCX?))(?:[#\?][^"\']*)?["\']',
+                    html_text, flags=re.IGNORECASE
+                )
                 if links:
                     target_url = urljoin(url, links[0])
-                    rr = requests.get(target_url, timeout=30, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
+                    rr = requests.get(
+                        target_url,
+                        timeout=30,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                        },
+                        allow_redirects=True,
+                    )
                     rr.raise_for_status()
                     target_ct = rr.headers.get("Content-Type", "").lower()
                     tdata = rr.content
-                    if tdata[:4] == b"%PDF" or "pdf" in target_ct:
-                        chosen_kind = "pdf"; data = tdata; clean_url = target_url.split("?")[0]
-                    elif tdata[:8] == b"\x89PNG\r\n\x1a\n" or tdata[:3] == b"\xff\xd8\xff" or any(ic in target_ct for ic in ["image/png", "image/jpeg", "image/jpg"]):
-                        chosen_kind = "image"; data = tdata; clean_url = target_url.split("?")[0]
+                    t_clean = target_url.split("?")[0]
+                    t_ext = os.path.splitext(t_clean)[1].lower()
+
+                    if tdata[:4] == b"%PDF" or "pdf" in target_ct or t_ext == ".pdf":
+                        chosen_kind = "pdf"; data = tdata; clean_url = t_clean
+                    elif tdata[:8] == b"\x89PNG\r\n\x1a\n" or tdata[:3] == b"\xff\xd8\xff" or any(ic in target_ct for ic in ["image/png","image/jpeg","image/jpg"]) or t_ext in [".png",".jpg",".jpeg"]:
+                        chosen_kind = "image"; data = tdata; clean_url = t_clean
                         st.session_state.image_bytes = data
+                    elif t_ext == ".docx" or "vnd.openxmlformats-officedocument.wordprocessingml.document" in target_ct:
+                        chosen_kind = "docx"; data = tdata; clean_url = t_clean
+                    elif t_ext == ".doc" or "application/msword" in target_ct:
+                        chosen_kind = "doc"; data = tdata; clean_url = t_clean
+
                 if not chosen_kind:
                     stripped = re.sub(r"<script[\s\S]*?</script>", " ", html_text, flags=re.IGNORECASE)
                     stripped = re.sub(r"<style[\s\S]*?</style>", " ", stripped, flags=re.IGNORECASE)
@@ -945,17 +2027,22 @@ with col1:
                     st.session_state.ocr_content = text_only
                     if st.session_state.ocr_content:
                         _build_retrieval_index(st.session_state.ocr_content)
-                        build_table_and_chart_caches()
                         return True, "Webpage processed as text."
                     return False, "No content extracted from webpage."
+
             if not chosen_kind:
                 return False, f"Unsupported content type: {content_type or ext}"
-            st.session_state.ocr_content = process_document_with_gemini(chosen_kind, os.path.basename(clean_url) or "download", data)
+
+            st.session_state.ocr_content = process_document_with_gemini(
+                chosen_kind, os.path.basename(clean_url) or "download", data
+            )
             if chosen_kind == "image":
-                st.session_state.image_bytes = data
+                if "image_bytes" not in st.session_state or not isinstance(st.session_state.image_bytes, dict):
+                    st.session_state.image_bytes = {}
+                st.session_state.image_bytes[os.path.basename(clean_url) or "image"] = data
+
             if st.session_state.ocr_content:
                 _build_retrieval_index(st.session_state.ocr_content)
-                build_table_and_chart_caches()
                 return True, "Document processed successfully!"
             return False, "No content extracted."
         except Exception as e:
@@ -972,17 +2059,35 @@ with col1:
                         ext = os.path.splitext(uploaded_file.name)[1].lower()
                         if ext == ".pdf":
                             kind = "pdf"
-                        elif ext in [".doc", ".docx"]:
-                            kind = "word"
-                        else:
+                        elif ext in [".png", ".jpg", ".jpeg"]:
                             kind = "image"
+                        elif ext == ".docx":
+                            kind = "docx"
+                        elif ext == ".doc":
+                            kind = "doc"
+                        else:
+                            kind = "unknown"
+
                         if kind == "image":
                             if "image_bytes" not in st.session_state:
                                 st.session_state.image_bytes = {}
                             st.session_state.image_bytes[uploaded_file.name] = uploaded_file.getvalue()
-                        content = process_document_with_gemini(kind, uploaded_file.name, uploaded_file.getvalue())
+                        
+                        if kind == "unknown":
+                            st.warning(f"Unsupported file type for {uploaded_file.name}. Skipped.")
+                            continue
+
+                        content = process_document_with_gemini(
+                            kind, uploaded_file.name, uploaded_file.getvalue()
+                        )
+                        
                         if content:
-                            doc_info = {"name": uploaded_file.name, "type": kind, "content": content, "size": len(uploaded_file.getvalue())}
+                            doc_info = {
+                                "name": uploaded_file.name,
+                                "type": kind,
+                                "content": content,
+                                "size": len(uploaded_file.getvalue())
+                            }
                             st.session_state.documents.append(doc_info)
                             all_content.append(f"--- DOCUMENT: {uploaded_file.name} ---\n{content}")
                             st.success(f"Document {uploaded_file.name} processed successfully!")
@@ -990,17 +2095,22 @@ with col1:
                             st.warning(f"No content extracted from {uploaded_file.name}.")
                     except Exception as e:
                         st.error(f"Error processing {uploaded_file.name}: {e}")
+                
                 if all_content:
                     st.session_state.ocr_content = "\n\n".join(all_content)
                     _build_retrieval_index(st.session_state.ocr_content)
-                    build_table_and_chart_caches()
                     st.success(f"All {len(uploaded_files)} documents processed and combined!")
         if url_input:
             with st.spinner("Downloading & processing from URL..."):
                 success, msg = process_url_to_content(url_input)
                 if success:
                     if st.session_state.get("ocr_content"):
-                        url_doc_info = {"name": f"URL: {url_input[:50]}...", "type": "url", "content": st.session_state.ocr_content, "size": len(st.session_state.ocr_content)}
+                        url_doc_info = {
+                            "name": f"URL: {url_input[:50]}...",
+                            "type": "url",
+                            "content": st.session_state.ocr_content,
+                            "size": len(st.session_state.ocr_content)
+                        }
                         st.session_state.documents.append(url_doc_info)
                     st.success(msg)
                 else:
@@ -1011,30 +2121,6 @@ with col1:
 with col2:
     st.header("Document Q&A")
 
-    # ========== Sidebar: Quick Numeric Viz & Export (dengan filter) ==========
-with st.sidebar:
-    st.markdown("---")
-    st.subheader("📈 Quick Numeric Viz & Export")
-
-    # Filter rentang nilai (default aktif 0–100)
-    st.caption("Filter angka agar hanya nilai ujian yang masuk (mis. 0–100)")
-    use_range = st.checkbox("Aktifkan filter rentang nilai", value=True, key="use_range")
-    min_val = st.number_input("Min nilai", value=0.0, step=1.0, key="min_val")
-    max_val = st.number_input("Max nilai", value=100.0, step=1.0, key="max_val")
-
-    # Hints opsional
-    doc_hint_input = st.text_input("Filter dokumen (opsional)", placeholder="mis. Harber / kedua / semua")
-    col_hint_input = st.text_input("Filter kolom (opsional)", placeholder="mis. skor / nilai")
-
-    agg_op = st.selectbox(
-        "Agregasi",
-        ["mean (rata-rata)", "sum (total)", "median", "min", "max", "std (deviasi baku)", "count (jumlah)"],
-        index=0
-    )
-    run_viz = st.button("▶️ Jalankan Analisis")
-
-# ========== Konten kanan (lanjutan) ==========
-with col2:
     if st.session_state.documents:
         st.markdown(f"**{len(st.session_state.documents)} document(s) loaded.**")
         
@@ -1042,9 +2128,12 @@ with col2:
         total_mb = total_chars / (1024 * 1024)
         
         c1, c2, c3 = st.columns([2, 2, 1])
-        with c1: st.metric("Total Documents", len(st.session_state.documents))
-        with c2: st.metric("Total Content", f"{total_chars:,} chars")
-        with c3: st.metric("Memory Usage", f"{total_mb:.1f} MB")
+        with c1:
+            st.metric("Total Documents", len(st.session_state.documents))
+        with c2:
+            st.metric("Total Content", f"{total_chars:,} chars")
+        with c3:
+            st.metric("Memory Usage", f"{total_mb:.1f} MB")
         
         if len(st.session_state.documents) > 10:
             st.warning("⚠️ Many documents loaded. Consider removing some to improve performance.")
@@ -1068,15 +2157,16 @@ with col2:
                                 st.session_state.image_bytes = {}
                         rebuild_document_content()
                         st.rerun()
+            
             if st.session_state.documents:
                 if st.button("🔄 Reset All Documents", type="secondary"):
                     clear_all_document_state()
                     st.rerun()
-
+        
         # ---------- Quick actions ----------
         if st.session_state.documents:
             st.markdown("**Quick Actions:**")
-            q1, q2, q3, q4 = st.columns(4)
+            q1, q2, q3 = st.columns(3)
             with q1:
                 if st.button("🗑️ Clear Chat", help="Clear chat history but keep documents"):
                     st.session_state.chat_history = []
@@ -1086,20 +2176,52 @@ with col2:
                     st.session_state.show_stats = not st.session_state.get('show_stats', False)
                     st.rerun()
             with q3:
-                if st.button("🔎 Parse/Refresh Tables", help="Parse/refresh tables from current documents"):
-                    build_table_and_chart_caches()
-                    a = st.session_state.get("parse_audit", {})
-                    st.success(f"Parsed {len(st.session_state.parsed_tables)} table(s); found {len(st.session_state.chart_numbers)} 'chart-number(s)'. Tables detected: {a.get('tables_detected',0)}.")
-            with q4:
-                if st.button("🧪 Audit Angka", help="Lihat breakdown angka yang terdeteksi & difilter"):
-                    build_table_and_chart_caches()
-                    a = st.session_state.get("parse_audit", {})
-                    st.info(f"Audit parsing → tables: {a.get('tables_detected',0)}, numbers_from_tables: {a.get('numbers_from_tables',0)}, numbers_from_text: {a.get('numbers_from_text',0)}")
+                if st.button("📈 Chart Examples", help="Show examples of chart requests"):
+                    st.session_state.show_chart_examples = not st.session_state.get('show_chart_examples', False)
+                    st.rerun()
+        
+        # ---------- Chart Examples ----------
+        if st.session_state.get('show_chart_examples', False):
+            st.markdown("### 📈 **Contoh Permintaan Grafik**")
+            st.markdown("""
+            **Grafik Batang (Bar Chart):**
+            - "Buat grafik batang dari data penjualan"
+            - "Tampilkan grafik batang nilai UTS/UAS kandidat"
+            - "Buat grafik batang perbandingan pendapatan antar bulan"
+            - "Buat grafik batang untuk membandingkan nilai antar dokumen"
+            
+            **Grafik Garis (Line Chart):**
+            - "Tampilkan grafik garis pendapatan dari waktu ke waktu"
+            - "Buat grafik garis trend nilai siswa"
+            - "Buat grafik garis untuk melihat perkembangan nilai"
+            - "Generate grafik garis trend data"
+            
+            **Grafik Lingkaran (Pie Chart):**
+            - "Buat grafik lingkaran dari pangsa pasar"
+            - "Tampilkan grafik lingkaran distribusi nilai"
+            - "Buat grafik lingkaran persentase kandidat"
+            - "Show me grafik lingkaran data"
+            
+            **Scatter Plot:**
+            - "Generate scatter plot harga vs kuantitas"
+            - "Buat scatter plot nilai UTS vs UAS"
+            - "Buat scatter plot korelasi dua variabel"
+            - "Show me scatter plot data"
+            
+            **Histogram:**
+            - "Buat histogram dari nilai ujian"
+            - "Tampilkan histogram distribusi data"
+            - "Buat histogram untuk melihat sebaran nilai"
+            - "Show me histogram data"
+            
+            **Auto-detection:** Sistem akan otomatis memilih tipe grafik terbaik jika Anda hanya meminta "grafik" atau "visualisasi".
+            """)
 
         # ---------- DASHBOARD ----------
         if st.session_state.get('show_stats', False):
             st.markdown("## 📊 Document Analytics Dashboard")
 
+            # Data agregat per dokumen
             stats_data = []
             combined_texts = []
             struct_total = {"text":0, "tables":0, "images":0}
@@ -1109,20 +2231,26 @@ with col2:
                 ocr_q = _compute_ocr_quality(txt)
                 words = len(_tokenize(txt))
                 lines = len(txt.splitlines())
-                stt = {"Document": doc['name'], "Type": doc['type'], "Size (chars)": doc['size'], "Words": words, "Lines": lines, "OCR Quality": round(ocr_q,1)}
+                stt = {
+                    "Document": doc['name'],
+                    "Type": doc['type'],
+                    "Size (chars)": doc['size'],
+                    "Words": words,
+                    "Lines": lines,
+                    "OCR Quality": round(ocr_q,1)
+                }
                 stats_data.append(stt)
                 s = _structure_stats(txt)
                 struct_total["text"] += s["text"]
                 struct_total["tables"] += s["tables"]
                 struct_total["images"] += s["images"]
 
-            combined = "\n\n".join(combined_texts)
             st.dataframe(stats_data, use_container_width=True)
 
             st.markdown("### Document Health")
             dh1, dh2 = st.columns([1,1])
             with dh1:
-                ocr_score = _compute_ocr_quality(combined)
+                ocr_score = _compute_ocr_quality("\n\n".join(combined_texts))
                 fig_g = go.Figure(go.Indicator(
                     mode="gauge+number",
                     value=ocr_score,
@@ -1144,7 +2272,7 @@ with col2:
                 fig_donut = px.pie(values=values, names=labels, hole=0.6, title="Document Structure Overview")
                 st.plotly_chart(fig_donut, use_container_width=True)
 
-            secs = _extract_sections(combined)
+            secs = _extract_sections("\n\n".join(combined_texts))
             sec_labels, cat_labels, mat = _missing_matrix(secs)
             fig_heat = px.imshow(mat, aspect="auto", color_continuous_scale="Viridis",
                                  labels=dict(x="Section", y="Missing Type", color="Count"),
@@ -1152,194 +2280,168 @@ with col2:
             fig_heat.update_layout(title="Missing Data Heatmap")
             st.plotly_chart(fig_heat, use_container_width=True)
 
-            st.markdown("### Parsed Tables Summary")
-            st.write(f"Detected **{len(st.session_state.parsed_tables)}** table(s) and **{len(st.session_state.chart_numbers)}** chart-number(s).")
-            for item in st.session_state.parsed_tables[:3]:
-                st.caption(f"Sample table from **{item['doc']}** (Table #{item['index']})")
-                st.dataframe(item["df"], use_container_width=True)
-
-        # ---------- Quick Numeric Viz & Export ----------
-        def collect_values_grouped_by_doc(doc_hint: Optional[str], col_hint: Optional[str]) -> Dict[str, list]:
-            grouped: Dict[str, list] = {}
-            if "parsed_tables" not in st.session_state:
-                build_table_and_chart_caches()
-
-            def match_doc(name: str) -> bool:
-                if not doc_hint:
-                    return True
-                dh = _norm(doc_hint)
-                if dh in {"semua", "semua dokumen", "all", "all documents", "kedua", "dua dokumen", "keduanya", "both"}:
-                    return True
-                return dh in _norm(name)
-
-            # Tabel
-            for item in st.session_state.get("parsed_tables", []):
-                dname = item["doc"]
-                if not match_doc(dname):
-                    continue
-                df = item["df"]
-                if col_hint:
-                    allow_cols = [c for c in df.columns if _norm(c) == _norm(col_hint)]
-                    vals = df_to_numeric_values(df, [_norm(c) for c in allow_cols]) if allow_cols else df_to_numeric_values(df, None)
-                else:
-                    vals = df_to_numeric_values(df, None)
-                if vals:
-                    grouped.setdefault(dname, []).extend(vals)
-
-            # Grafik/teks
-            for obj in st.session_state.get("chart_numbers", []):
-                dname = obj["doc"]
-                if not match_doc(dname):
-                    continue
-                try:
-                    v = float(obj["value"])
-                    grouped.setdefault(dname, []).append(v)
-                except Exception:
-                    pass
-
-            # Terapkan filter rentang
-            for k in list(grouped.keys()):
-                grouped[k] = apply_range_filter(grouped[k])
-                if not grouped[k]:
-                    grouped.pop(k, None)
-
-            return grouped
-
-        if run_viz:
-            if "parsed_tables" not in st.session_state:
-                build_table_and_chart_caches()
-
-            op_map = {
-                "mean (rata-rata)": "mean",
-                "sum (total)": "sum",
-                "median": "median",
-                "min": "min",
-                "max": "max",
-                "std (deviasi baku)": "std",
-                "count (jumlah)": "count",
-            }
-            op_key = op_map.get(agg_op, "mean")
-
-            grouped = collect_values_grouped_by_doc(doc_hint_input, col_hint_input)
-            all_vals = [val for arr in grouped.values() for val in arr]
-
-            st.markdown("## 📈 Hasil Analisis Angka")
-            if not grouped:
-                st.warning("Tidak ada angka yang cocok dengan filter. Coba nonaktifkan filter rentang di sidebar atau perbarui parsing tabel (Quick Actions → Parse/Refresh Tables).")
-            else:
-                # Ringkasan per dokumen
-                rows = []
-                for dname, vals in grouped.items():
-                    s = pd.Series(vals, dtype=float)
-                    row = {
-                        "Dokumen": dname,
-                        "Count": int(s.count()),
-                        "Mean": float(s.mean()) if s.count() else None,
-                        "Median": float(s.median()) if s.count() else None,
-                        "Min": float(s.min()) if s.count() else None,
-                        "Max": float(s.max()) if s.count() else None,
-                        "Std": float(s.std(ddof=1)) if s.count() > 1 else 0.0,
-                        "Sum": float(s.sum()) if s.count() else None,
-                    }
-                    rows.append(row)
-                df_summary = pd.DataFrame(rows).sort_values("Dokumen").reset_index(drop=True)
-
-                # Agregat global
-                val_global, n_global = aggregate_numbers_from_all_tables_and_charts(
-                    op_key, doc_hint_input if doc_hint_input else None, col_hint_input if col_hint_input else None
-                )
-                if val_global is not None:
-                    if ANSWER_LANGUAGE == "Bahasa Indonesia":
-                        st.success(f"**{agg_op}** ({'semua dokumen' if not doc_hint_input else f'filter dokumen: {doc_hint_input}' }{', kolom: ' + col_hint_input if col_hint_input else ''}) = **{val_global:,.4f}** dari **{n_global}** nilai.")
-                    else:
-                        st.success(f"**{agg_op}** ({'all documents' if not doc_hint_input else f'doc filter: {doc_hint_input}' }{', column: ' + col_hint_input if col_hint_input else ''}) = **{val_global:,.4f}** based on **{n_global}** values.")
-
-                st.markdown("### Ringkasan per Dokumen")
-                st.dataframe(df_summary, use_container_width=True)
-
-                # Visualisasi
-                try:
-                    long_rows = []
-                    for dname, vals in grouped.items():
-                        for v in vals:
-                            long_rows.append({"Dokumen": dname, "Nilai": float(v)})
-                    dfl = pd.DataFrame(long_rows)
-
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown("#### Histogram Nilai")
-                        fig_hist = px.histogram(dfl, x="Nilai", nbins=30, color="Dokumen")
-                        st.plotly_chart(fig_hist, use_container_width=True)
-                    with c2:
-                        st.markdown("#### Box Plot per Dokumen")
-                        fig_box = px.box(dfl, x="Dokumen", y="Nilai", points="outliers")
-                        st.plotly_chart(fig_box, use_container_width=True)
-
-                    st.markdown("#### Rata-rata per Dokumen (Bar)")
-                    df_bar = dfl.groupby("Dokumen", as_index=False)["Nilai"].mean().rename(columns={"Nilai": "Mean"})
-                    fig_bar = px.bar(df_bar, x="Dokumen", y="Mean", text="Mean")
-                    fig_bar.update_traces(texttemplate="%{text:.2f}", textposition="outside")
-                    fig_bar.update_layout(yaxis_title="Mean", xaxis_title="Dokumen")
-                    st.plotly_chart(fig_bar, use_container_width=True)
-
-                except Exception as e:
-                    st.warning(f"Gagal membuat grafik: {e}")
-
-                # Ekspor CSV
-                try:
-                    csv_df = pd.DataFrame([(doc, v) for doc, arr in grouped.items() for v in arr], columns=["Dokumen", "Nilai"])
-                    if col_hint_input:
-                        csv_df["KolomFilter"] = col_hint_input
-                    csv_bytes = csv_df.to_csv(index=False).encode("utf-8")
-                    st.download_button("💾 Download Nilai (CSV)", data=csv_bytes, file_name="extracted_numeric_values.csv", mime="text/csv")
-                except Exception as e:
-                    st.warning(f"Gagal menyiapkan CSV: {e}")
-
-    # ---------- Chat history ----------
-    if st.session_state.get("chat_history"):
-        st.markdown("### Chat")
+        # ---------- Chat history ----------
         for m in st.session_state.chat_history:
             role = "You" if m["role"] == "user" else "Assistant"
             st.markdown(f"**{role}:** {m['content']}")
+            
+            # Display chart if available
+            if m.get("chart") and m["role"] == "assistant":
+                st.markdown("📊 **Visualization:**")
+                st.plotly_chart(m["chart"], use_container_width=True)
+                
+                # Show chart info
+                if m.get("chart_message"):
+                    st.info(m["chart_message"])
 
-    # ---------- Q&A input ----------
-    if st.session_state.documents:
+        # ---------- Q&A input ----------
         with st.form("qa_form_docs", clear_on_submit=True):
-            user_q = st.text_input("Your question (can ask about specific documents or compare them):", key="qa_input")
+            user_q = st.text_input(
+                "Your question (can ask about specific documents or compare them):",
+                key="qa_input"
+            )
             submitted = st.form_submit_button("Ask")
+
         if submitted and user_q:
             st.session_state.chat_history.append({"role": "user", "content": user_q})
             with st.spinner("Generating response..."):
-                if not google_api_key:
-                    ans = "Please provide a valid Google API Key."
-                else:
-                    if "parsed_tables" not in st.session_state:
-                        build_table_and_chart_caches()
-                    ans = generate_response_with_fallback(st.session_state.ocr_content, user_q)
-            st.session_state.chat_history.append({"role": "assistant", "content": ans})
-            st.rerun()
+                ans = None
+                chart = None
+                chart_message = ""
+                
+                try:
+                    docs_to_use = select_docs_for_query(user_q, st.session_state.documents)
+                    
+                    # Check for visualization intent first
+                    viz_success, viz_msg, viz_chart = generate_visualization(user_q, docs_to_use)
+                    if viz_success:
+                        chart = viz_chart
+                        chart_message = viz_msg
+                        if ANSWER_LANGUAGE == "Bahasa Indonesia":
+                            ans = f"✅ {chart_message}\n\nSaya telah membuat visualisasi berdasarkan data dari dokumen Anda. Grafik ditampilkan di bawah ini."
+                        else:
+                            ans = f"✅ {chart_message}\n\nI have created a visualization based on your document data. The chart is displayed below."
+                    else:
+                        # Try average calculation
+                        avg_results = compute_average_per_doc(user_q, docs_to_use)
+                        if avg_results:
+                            if len(avg_results) == 1:
+                                r = avg_results[0]
+                                val_str = f"{r['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                                if ANSWER_LANGUAGE == "Bahasa Indonesia":
+                                    ans = f"Rata-rata di dokumen **{r['doc']}** untuk kolom **{r['column']}** adalah **{val_str}** (n={r['n']})."
+                                else:
+                                    ans = f"The average in document **{r['doc']}** for column **{r['column']}** is **{val_str}** (n={r['n']})."
+                            else:
+                                ans_lines = []
+                                for r in avg_results:
+                                    val_str = f"{r['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                                    ans_lines.append(f"- **{r['doc']}** → {val_str} (n={r['n']})")
+                                best = max(avg_results, key=lambda x: x["value"])
+                                if ANSWER_LANGUAGE == "Bahasa Indonesia":
+                                    ans = "Hasil rata-rata per dokumen:\n" + "\n".join(ans_lines)
+                                    ans += f"\n\n📊 Nilai tertinggi ada di **{best['doc']}** dengan rata-rata {best['value']:.2f}."
+                                else:
+                                    ans = "Average per document:\n" + "\n".join(ans_lines)
+                                    ans += f"\n\n📊 Highest is in **{best['doc']}** with average {best['value']:.2f}."
+                
+                except Exception as e:
+                    st.error(f"Error processing query: {str(e)}")
+                    avg_results = []
+                
+                if not ans:
+                    if not google_api_key:
+                        ans = "Please provide a valid Google API Key."
+                    else:
+                        ans = generate_response_with_fallback(st.session_state.ocr_content, user_q)
+                
+                # Store response with chart info
+                response_data = {"role": "assistant", "content": ans}
+                if chart:
+                    response_data["chart"] = chart
+                    response_data["chart_message"] = chart_message
+                
+                st.session_state.chat_history.append(response_data)
+                st.rerun()
+
     else:
         st.info("No documents processed yet. You can either upload files or just type a URL below and press Ask.")
         with st.form("qa_form_nodocs", clear_on_submit=True):
-            user_q = st.text_input("Your question (can ask about specific documents or compare them):", key="qa_input")
+            user_q = st.text_input(
+                "Your question (can ask about specific documents or compare them):",
+                key="qa_input"
+            )
             submitted = st.form_submit_button("Ask")
 
         if submitted and user_q:
             url_candidate = st.session_state.get("url_input")
             if url_candidate and not st.session_state.get("ocr_content"):
-                st.warning("Processing URL before answering...")
-                # NOTE: memanggil helper di kolom lain tidak nyaman; minta user klik Process Documents.
-                st.stop()
+                with st.spinner("Processing URL before answering..."):
+                    success, msg = process_url_to_content(url_candidate)
+                    if not success:
+                        st.error(msg)
+                        st.stop()
             if st.session_state.get("ocr_content"):
-                build_table_and_chart_caches()
                 st.session_state.chat_history.append({"role": "user", "content": user_q})
                 with st.spinner("Generating response..."):
-                    if not google_api_key:
-                        ans = "Please provide a valid Google API Key."
-                    else:
-                        ans = generate_response_with_fallback(st.session_state.ocr_content, user_q)
-                st.session_state.chat_history.append({"role": "assistant", "content": ans})
-                st.rerun()
+                    ans = None
+                    chart = None
+                    chart_message = ""
+                    
+                    try:
+                        docs_to_use = select_docs_for_query(user_q, st.session_state.documents)
+                        
+                        # Check for visualization intent first
+                        viz_success, viz_msg, viz_chart = generate_visualization(user_q, docs_to_use)
+                        if viz_success:
+                            chart = viz_chart
+                            chart_message = viz_msg
+                            if ANSWER_LANGUAGE == "Bahasa Indonesia":
+                                ans = f"✅ {chart_message}\n\nSaya telah membuat visualisasi berdasarkan data dari dokumen Anda. Grafik ditampilkan di bawah ini."
+                            else:
+                                ans = f"✅ {chart_message}\n\nI have created a visualization based on your document data. The chart is displayed below."
+                        else:
+                            # Try average calculation
+                            avg_results = compute_average_per_doc(user_q, docs_to_use)
+                            if avg_results:
+                                if len(avg_results) == 1:
+                                    r = avg_results[0]
+                                    val_str = f"{r['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                                    if ANSWER_LANGUAGE == "Bahasa Indonesia":
+                                        ans = f"Rata-rata di dokumen **{r['doc']}** untuk kolom **{r['column']}** adalah **{val_str}** (n={r['n']})."
+                                    else:
+                                        ans = f"The average in document **{r['doc']}** for column **{r['column']}** is **{val_str}** (n={r['n']})."
+                                else:
+                                    ans_lines = []
+                                    for r in avg_results:
+                                        val_str = f"{r['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                                        ans_lines.append(f"- **{r['doc']}** → {val_str} (n={r['n']})")
+                                    best = max(avg_results, key=lambda x: x["value"])
+                                    if ANSWER_LANGUAGE == "Bahasa Indonesia":
+                                        ans = "Hasil rata-rata per dokumen:\n" + "\n".join(ans_lines)
+                                        ans += f"\n\n📊 Nilai tertinggi ada di **{best['doc']}** dengan rata-rata {best['value']:.2f}."
+                                    else:
+                                        ans = "Average per document:\n" + "\n".join(ans_lines)
+                                        ans += f"\n\n📊 Highest is in **{best['doc']}** with average {best['value']:.2f}."
+                    
+                    except Exception as e:
+                        st.error(f"Error processing query: {str(e)}")
+                        avg_results = []
+                    
+                    if not ans:
+                        if not google_api_key:
+                            ans = "Please provide a valid Google API Key."
+                        else:
+                            ans = generate_response_with_fallback(st.session_state.ocr_content, user_q)
+                    
+                    # Store response with chart info
+                    response_data = {"role": "assistant", "content": ans}
+                    if chart:
+                        response_data["chart"] = chart
+                        response_data["chart_message"] = chart_message
+                    
+                    st.session_state.chat_history.append(response_data)
+                    st.rerun()
             else:
                 st.warning("Please provide a URL or upload a document first.")
 
@@ -1348,5 +2450,8 @@ if st.session_state.get("documents"):
     with st.expander("📄 View All Document Contents"):
         for i, doc in enumerate(st.session_state.documents):
             st.markdown(f"### {doc['name']} ({doc['type']})")
-            st.markdown(doc['content'])
+            if isinstance(doc['content'], str) and ("<table" in doc['content'] or "<p" in doc['content'] or "</table>" in doc['content']):
+                st.markdown(doc['content'], unsafe_allow_html=True)
+            else:
+                st.markdown(doc['content'])
             st.markdown("---")
