@@ -1695,6 +1695,11 @@ def _create_chart(df: pd.DataFrame, chart_type: str, query: str, documents: list
             hovertemplate='<b>%{x}</b><br>Nilai: %{y}<extra></extra>'
         )
         
+        # Add unique identifier to prevent duplicate element ID errors
+        fig.update_layout(
+            title=dict(text=fig.layout.title.text + f" (ID: {hash(str(fig))})")
+        )
+        
         return fig
         
     except Exception as e:
@@ -2264,13 +2269,13 @@ with col2:
                                {'range': [75,100], 'color': "#e8f5e9"},
                            ]}
                 ))
-                st.plotly_chart(fig_g, use_container_width=True)
+                st.plotly_chart(fig_g, use_container_width=True, key="ocr_gauge_chart")
 
             with dh2:
                 labels = ["Text", "Tables", "Images"]
                 values = [max(1, struct_total["text"]), max(1, struct_total["tables"]), max(1, struct_total["images"])]
                 fig_donut = px.pie(values=values, names=labels, hole=0.6, title="Document Structure Overview")
-                st.plotly_chart(fig_donut, use_container_width=True)
+                st.plotly_chart(fig_donut, use_container_width=True, key="structure_donut_chart")
 
             secs = _extract_sections("\n\n".join(combined_texts))
             sec_labels, cat_labels, mat = _missing_matrix(secs)
@@ -2278,17 +2283,17 @@ with col2:
                                  labels=dict(x="Section", y="Missing Type", color="Count"),
                                  x=sec_labels, y=cat_labels)
             fig_heat.update_layout(title="Missing Data Heatmap")
-            st.plotly_chart(fig_heat, use_container_width=True)
+            st.plotly_chart(fig_heat, use_container_width=True, key="missing_data_heatmap")
 
         # ---------- Chat history ----------
-        for m in st.session_state.chat_history:
+        for i, m in enumerate(st.session_state.chat_history):
             role = "You" if m["role"] == "user" else "Assistant"
             st.markdown(f"**{role}:** {m['content']}")
             
             # Display chart if available
             if m.get("chart") and m["role"] == "assistant":
                 st.markdown("📊 **Visualization:**")
-                st.plotly_chart(m["chart"], use_container_width=True)
+                st.plotly_chart(m["chart"], use_container_width=True, key=f"chart_{i}_{hash(str(m.get('chart_message', '')))}")
                 
                 # Show chart info
                 if m.get("chart_message"):
