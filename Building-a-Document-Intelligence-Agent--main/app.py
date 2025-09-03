@@ -2460,3 +2460,174 @@ if st.session_state.get("documents"):
             else:
                 st.markdown(doc['content'])
             st.markdown("---")
+
+def _create_average_comparison_data(query: str, documents: list) -> pd.DataFrame:
+    """Create aggregated data for average value comparison in pie charts."""
+    try:
+        if not documents or len(documents) < 2:
+            return None
+            
+        comparison_data = []
+        
+        for doc in documents:
+            try:
+                doc_name = doc.get("name", "Unknown")
+                content = doc.get("content", "")
+                
+                # Extract tables from document content
+                tables = []
+                
+                # HTML tables
+                if "<table" in content.lower():
+                    tables.extend(_parse_html_tables(content))
+                
+                # Markdown tables
+                tables.extend(_parse_markdown_tables(content))
+                
+                # Find best table with UTS/UAS data
+                best_avg = None
+                best_score = 0
+                
+                for df, meta in tables:
+                    if df.empty or df.shape[0] < 2:
+                        continue
+                    
+                    # Look for UTS/UAS columns
+                    uts_col = None
+                    uas_col = None
+                    
+                    for col in df.columns:
+                        col_lower = col.lower()
+                        if any(keyword in col_lower for keyword in ["uts", "ujian tengah", "midterm"]):
+                            uts_col = col
+                        elif any(keyword in col_lower for keyword in ["uas", "ujian akhir", "final"]):
+                            uas_col = col
+                    
+                    # Calculate average from UTS or UAS column
+                    if uts_col or uas_col:
+                        target_col = uts_col if uts_col else uas_col
+                        
+                        # Clean numeric data
+                        df_clean = df.copy()
+                        df_clean[target_col] = pd.to_numeric(
+                            df_clean[target_col].astype(str)
+                                .str.replace(r'[^\d\-\.,]', '', regex=True)
+                                .str.replace('.', '', regex=False)
+                                .str.replace(',', '.', regex=False),
+                            errors='coerce'
+                        )
+                        
+                        # Remove NaN values
+                        df_clean = df_clean.dropna(subset=[target_col])
+                        
+                        if len(df_clean) >= 2:
+                            # Filter reasonable values (0-100 for scores)
+                            valid_values = df_clean[target_col][(df_clean[target_col] >= 0) & (df_clean[target_col] <= 100)]
+                            
+                            if len(valid_values) >= 2:
+                                avg_value = float(valid_values.mean())
+                                score = len(valid_values)  # More data = better score
+                                
+                                if score > best_score:
+                                    best_score = score
+                                    best_avg = {
+                                        'document': doc_name,
+                                        'average_value': avg_value,
+                                        'count': len(valid_values),
+                                        'column': target_col
+                                    }
+                
+                # If no UTS/UAS data found, try to find any numeric column
+                if best_avg is None:
+                    for df, meta in tables:
+                        if df.empty or df.shape[0] < 2:
+                            continue
+                        
+                        # Find numeric columns
+                        numeric_cols = []
+                        for col in df.columns:
+                            try:
+                                pd.to_numeric(df[col].astype(str).str.replace(r'[^\d\-\.,]', '', regex=True), errors='coerce')
+                                numeric_cols.append(col)
+                            except:
+                                continue
+                        
+                        if numeric_cols:
+                            # Use first numeric column
+                            target_col = numeric_cols[0]
+                            df_clean = df.copy()
+                            df_clean[target_col] = pd.to_numeric(
+                                df_clean[target_col].astype(str)
+                                    .str.replace(r'[^\d\-\.,]', '', regex=True)
+                                    .str.replace('.', '', regex=False)
+                                    .str.replace(',', '.', regex=False),
+                                errors='coerce'
+                            )
+                            
+                            df_clean = df_clean.dropna(subset=[target_col])
+                            if len(df_clean) >= 2:
+                                avg_value = float(df_clean[target_col].mean())
+                                score = len(df_clean)
+                                
+                                if score > best_score:
+                                    best_score = score
+                                    best_avg = {
+                                        'document': doc_name,
+                                        'average_value': avg_value,
+                                        'count': len(df_clean),
+                                        'column': target_col
+                                    }
+                
+                if best_avg:
+                    comparison_data.append(best_avg)
+                else:
+                    # Fallback: use document count
+                    table_count = _estimate_document_data_count(content)
+                    comparison_data.append({
+                        'document': doc_name,
+                        'average_value': table_count,  # Use count as fallback
+                        'count': table_count,
+                        'column': 'estimated_count'
+                    })
+                
+            except Exception as e:
+                st.warning(f"Warning: Could not process document {doc.get('name', 'Unknown')}: {str(e)}")
+                continue
+        
+        if len(comparison_data) >= 2:  # Need at least 2 documents to compare
+            df_result = pd.DataFrame(comparison_data)
+            # Sort by average value descending for better visualization
+            df_result = df_result.sort_values('average_value', ascending=False)
+            return df_result
+        
+        return None
+        
+    except Exception as e:
+        st.error(f"Error creating average comparison data: {str(e)}")
+        return None
+
+def _estimate_document_data_count(content: str) -> int:
+    """Estimate the number of data rows in a document."""
+    try:
+        # Method 1: Count table rows from HTML
+        if "<table" in content.lower():
+            table_rows = content.lower().count("<tr>")
+            table_headers = content.lower().count("<th>")
+            return max(1, table_rows - table_headers)
+        
+        # Method 2: Count from markdown tables
+        elif "|" in content:
+            lines = content.split('\n')
+            table_lines = [line for line in lines if '|' in line and line.strip()]
+            separator_lines = [line for line in table_lines if re.match(r'^\s*\|[\s\-:]+\|\s*$', line)]
+            return max(1, len(table_lines) - len(separator_lines))
+        
+        # Method 3: Estimate from content
+        else:
+            lines = content.split('\n')
+            data_lines = [line for line in lines if len(line.strip()) > 10 and 
+                        (re.search(r'\d+', line) or re.search(r'[A-Za-z]+\s+[A-Za-z]+', line))]
+            return max(1, len(data_lines))
+            
+    except Exception:
+        return 1
