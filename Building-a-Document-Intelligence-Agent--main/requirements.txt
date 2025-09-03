@@ -4,6 +4,8 @@ google-generativeai
 python-dotenv
 pillow
 PyPDF2
-python-docx
-docx2txt
+plotly
+numpy
+requests
 wordcloud
+docx2txt
