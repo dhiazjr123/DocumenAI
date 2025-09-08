@@ -1046,7 +1046,7 @@ def _parse_markdown_tables(md_text: str) -> list:
 
     return tables
 
-# === NEW: parser tabel HTML (hasil DOCX) ===
+# === parser tabel HTML (hasil DOCX) ===
 def _parse_html_tables(html_text: str) -> list:
     """
     Parse <table> HTML (hasil DOCX) menjadi list of (DataFrame, meta).
@@ -1101,17 +1101,6 @@ def _is_avg_intent(q: str) -> bool:
     keys = ["rata rata", "rata-rata", "average", "avg", "mean"]
     return any(k in ql for k in keys)
 
-def _is_visualization_intent(q: str) -> bool:
-    """Detect if user wants a visualization/chart."""
-    ql = q.lower()
-    viz_keywords = [
-        "grafik", "chart", "visualisasi", "visualization", "plot", "diagram", 
-        "bar chart", "line chart", "pie chart", "histogram", "scatter plot",
-        "tampilkan grafik", "buat grafik", "show chart", "create chart",
-        "gambar grafik", "draw chart", "plot data", "visualize data"
-    ]
-    return any(keyword in ql for keyword in viz_keywords)
-
 def _extract_target_column_terms(q: str) -> list:
     quoted = re.findall(r'[""](.+?)[""]', q)
     terms = [t.strip() for t in quoted if t.strip()]
@@ -1141,28 +1130,37 @@ def _normalize_col(s: str) -> str:
 def _guess_best_column(df: pd.DataFrame, query: str) -> str | None:
     if df.empty or df.shape[1] == 0:
         return None
-    colmap = {c: _normalize_col(c) for c in df.columns}
+
+    colmap = {c: _normalize_col(str(c)) for c in df.columns}
     terms = _extract_target_column_terms(query)
+
     synonyms = {
-        "harga": ["price", "amount", "nilai", "nominal", "jumlah"],
-        "pendapatan": ["revenue", "sales", "omzet"],
+        "harga": ["price", "amount", "nilai", "nominal", "jumlah", "cost", "biaya"],
+        "pendapatan": ["revenue", "sales", "omzet", "income"],
         "laba": ["profit", "net profit", "laba bersih", "income"],
-        "tanggal": ["date", "periode", "period", "bulan", "month", "year", "tahun"],
+        "tanggal": ["date", "periode", "period", "bulan", "month", "year", "tahun", "waktu", "time"],
         "qty": ["quantity", "jumlah", "kuantitas", "volume"],
-        # penting untuk kasus nilai mahasiswa
-        "nilai": ["score", "skor", "uts", "uas", "nilai uts", "nilai uas", "nilai uts/uas", "nilai ujian"],
+        "nilai": ["score", "skor", "uts", "uas", "nilai uts", "nilai uas", "nilai ujian", "grade"],
     }
-    candidates = []
+
+    candidates: list[str] = []
+
     for t in terms:
         nt = _normalize_col(t)
+
+        # langsung cocok (substring/equals)
         for orig, norm in colmap.items():
             if nt == norm or nt in norm or norm in nt:
                 candidates.append(orig)
+
+        # fuzzy langsung
         close = difflib.get_close_matches(nt, list(colmap.values()), n=1, cutoff=0.75)
         if close:
             for orig, norm in colmap.items():
                 if norm == close[0]:
                     candidates.append(orig)
+
+        # fuzzy via sinonim
         for base, syns in synonyms.items():
             if nt == base or nt in syns:
                 close2 = difflib.get_close_matches(base, list(colmap.values()), n=1, cutoff=0.6)
@@ -1170,6 +1168,8 @@ def _guess_best_column(df: pd.DataFrame, query: str) -> str | None:
                     for orig, norm in colmap.items():
                         if norm == close2[0]:
                             candidates.append(orig)
+
+    # pilih kandidat numeric yang cukup valid
     for c in candidates:
         s = pd.to_numeric(
             df[c].astype(str)
@@ -1180,6 +1180,8 @@ def _guess_best_column(df: pd.DataFrame, query: str) -> str | None:
         )
         if s.notna().sum() >= max(2, int(len(s)*0.5)):
             return c
+
+    # fallback: kolom dengan angka valid terbanyak
     best_col = None; best_score = -1
     for c in df.columns:
         s = pd.to_numeric(
@@ -1328,6 +1330,256 @@ def compute_average_per_doc(query: str, documents: list) -> list[dict]:
 
     return results
 
+# ======================= VISUALIZATION HELPERS & ENGINE =======================
+def _is_visualization_intent(q: str) -> bool:
+    ql = q.lower()
+    keys = ["grafik","chart","visualisasi","visualization","plot","diagram",
+            "bar","line","pie","histogram","scatter","batang","garis","lingkaran","donut"]
+    return any(k in ql for k in keys)
+
+def _detect_chart_type(query: str) -> str:
+    ql = query.lower()
+    if any(k in ql for k in ["bar","batang"]): return "bar"
+    if any(k in ql for k in ["line","garis","trend"]): return "line"
+    if any(k in ql for k in ["pie","lingkaran","donut"]): return "pie"
+    if "scatter" in ql: return "scatter"
+    if any(k in ql for k in ["histogram","distribusi","distribution"]): return "histogram"
+    return "auto"
+
+def _select_best_value_column(df: pd.DataFrame, query: str, numeric_cols: list) -> str | None:
+    ql = query.lower()
+    pri = {
+        'uts': ['uts','ujian tengah','midterm'],
+        'uas': ['uas','ujian akhir','final'],
+        'nilai': ['nilai','score','skor','grade','hasil'],
+        'pendapatan': ['pendapatan','revenue','income','penjualan'],
+        'harga': ['harga','price','cost','biaya'],
+        'kuantitas': ['kuantitas','quantity','jumlah','volume']
+    }
+    for col in df.columns:
+        col_lower = str(col).lower()
+        for kws in pri.values():
+            if any(k in col_lower for k in kws) and col in numeric_cols:
+                return col
+    for kws in pri.values():
+        if any(k in ql for k in kws):
+            for col in numeric_cols:
+                if any(k in str(col).lower() for k in kws):
+                    return col
+    return numeric_cols[0] if numeric_cols else None
+
+def _select_best_label_column(df: pd.DataFrame, query: str, value_col: str) -> str | None:
+    ql = query.lower()
+    keys = {
+        'kandidat': ['kandidat','candidate','nama','name','mahasiswa','student'],
+        'bulan': ['bulan','month','periode','period'],
+        'kategori': ['kategori','category','jenis','type','kelompok']
+    }
+    for col in df.columns:
+        if col == value_col: 
+            continue
+        try:
+            pd.to_numeric(df[col], errors='coerce')
+            continue
+        except:
+            pass
+        if df[col].nunique() > 20:
+            continue
+        col_lower = str(col).lower()
+        if any(any(k in col_lower for k in kws) for kws in keys.values()):
+            return col
+    if any(any(k in ql for k in kws) for kws in keys.values()):
+        for col in df.columns:
+            if col == value_col: 
+                continue
+            try:
+                pd.to_numeric(df[col], errors='coerce'); 
+                continue
+            except:
+                pass
+            if df[col].nunique() <= 20:
+                return col
+    for col in df.columns:
+        if col == value_col: 
+            continue
+        try:
+            pd.to_numeric(df[col], errors='coerce'); 
+            continue
+        except:
+            pass
+        if df[col].nunique() <= 20:
+            return col
+    return None
+
+def _select_best_sequence_column(df: pd.DataFrame, query: str, value_col: str) -> str | None:
+    ql = query.lower()
+    seq = {
+        'urutan': ['urutan','order','ranking','peringkat','rank'],
+        'waktu': ['waktu','time','tanggal','date','bulan','month','tahun','year'],
+        'index': ['index','nomor','number','id']
+    }
+    for col in df.columns:
+        if col == value_col: 
+            continue
+        col_lower = str(col).lower()
+        if any(any(k in col_lower for k in kws) for kws in seq.values()):
+            try:
+                pd.to_numeric(df[col], errors='coerce')
+                return col
+            except: 
+                pass
+    if any(any(k in ql for k in kws) for kws in seq.values()):
+        for col in df.columns:
+            if col == value_col: 
+                continue
+            try:
+                pd.to_numeric(df[col], errors='coerce')
+                return col
+            except: 
+                pass
+    for col in df.columns:
+        if col != value_col:
+            try:
+                pd.to_numeric(df[col], errors='coerce')
+                return col
+            except: 
+                pass
+    return None
+
+def _select_best_x_column(df: pd.DataFrame, query: str, numeric_cols: list, value_col: str) -> str | None:
+    for col in numeric_cols:
+        if col != value_col:
+            return col
+    return numeric_cols[0] if len(numeric_cols) > 1 else None
+
+def _create_categorized_pie_data(df: pd.DataFrame, value_col: str) -> pd.DataFrame | None:
+    vals = pd.to_numeric(df[value_col], errors='coerce').dropna()
+    if len(vals) < 2:
+        return None
+    categories, counts = [], []
+    if vals.max() <= 100 and vals.min() >= 0:
+        ranges = [(90,100,"A (90-100)"),(80,89,"B (80-89)"),(70,79,"C (70-79)"),(60,69,"D (60-69)"),(0,59,"E (<60)")]
+        for a,b,label in ranges:
+            n = len(vals[(vals>=a)&(vals<=b)])
+            if n>0: categories.append(label); counts.append(n)
+    else:
+        try:
+            q25,q50,q75 = vals.quantile([.25,.5,.75])
+            bins = [(vals.min(),q25,f"Q1 ({vals.min():.1f}-{q25:.1f})"),
+                    (q25,q50,f"Q2 ({q25:.1f}-{q50:.1f})"),
+                    (q50,q75,f"Q3 ({q50:.1f}-{q75:.1f})"),
+                    (q75,vals.max(),f"Q4 ({q75:.1f}-{vals.max():.1f})")]
+            for a,b,label in bins:
+                n = len(vals[(vals>=a)&(vals<=b)])
+                if n>0: categories.append(label); counts.append(n)
+        except Exception:
+            mn,mx = vals.min(), vals.max()
+            step = (mx-mn)/4 if mx>mn else 1
+            for i in range(4):
+                a = mn + i*step; b = mn + (i+1)*step if i<3 else mx
+                n = len(vals[(vals>=a)&(vals<=b)])
+                if n>0: categories.append(f"Range {i+1} ({a:.1f}-{b:.1f})"); counts.append(n)
+    if len(categories) > 1:
+        return pd.DataFrame({"category":categories,"count":counts})
+    return None
+
+def _create_chart(df: pd.DataFrame, chart_type: str, query: str, documents=None):
+    if df.empty or df.shape[0] < 2:
+        return None
+    dfc = df.copy()
+
+    # deteksi numeric
+    numeric_cols = []
+    for c in dfc.columns:
+        try:
+            pd.to_numeric(dfc[c].astype(str).str.replace(r'[^\d\-\.,]', '', regex=True), errors='coerce')
+            numeric_cols.append(c)
+        except Exception:
+            pass
+    if not numeric_cols:
+        return None
+
+    value_col = _select_best_value_column(dfc, query, numeric_cols) or numeric_cols[0]
+    dfc[value_col] = pd.to_numeric(
+        dfc[value_col].astype(str)
+            .str.replace(r'[^\d\-\.,]', '', regex=True)
+            .str.replace('.', '', regex=False)
+            .str.replace(',', '.', regex=False),
+        errors='coerce'
+    )
+    dfc = dfc.dropna(subset=[value_col])
+    if len(dfc) < 2:
+        return None
+    if len(dfc) > 200:
+        dfc = dfc.head(200)
+
+    if chart_type == "bar":
+        label_col = _select_best_label_column(dfc, query, value_col)
+        fig = px.bar(dfc if label_col else dfc.reset_index(),
+                     x=label_col if label_col else "index",
+                     y=value_col,
+                     title=f"Bar Chart: {value_col}" + (f" by {label_col}" if label_col else ""),
+                     labels={value_col:"Value", (label_col or "index"):"Category"})
+
+    elif chart_type == "line":
+        seq_col = _select_best_sequence_column(dfc, query, value_col)
+        if seq_col:
+            dfc[seq_col] = pd.to_numeric(dfc[seq_col], errors='coerce')
+            dfc = dfc.dropna(subset=[seq_col]).sort_values(seq_col)
+            fig = px.line(dfc, x=seq_col, y=value_col,
+                          title=f"Line Chart: {value_col} vs {seq_col}",
+                          labels={value_col:"Value", seq_col:"Sequence"})
+        else:
+            fig = px.line(dfc.reset_index(), x="index", y=value_col,
+                          title=f"Line Chart: {value_col}",
+                          labels={value_col:"Value", "index":"Index"})
+
+    elif chart_type == "pie":
+        label_col = _select_best_label_column(dfc, query, value_col)
+        if label_col:
+            fig = px.pie(dfc, values=value_col, names=label_col,
+                         title=f"Pie Chart: {value_col} by {label_col}")
+        else:
+            cat = _create_categorized_pie_data(dfc, value_col)
+            if cat is None:
+                return None
+            fig = px.pie(cat, values='count', names='category',
+                         title=f"Pie Chart: Distribution of {value_col}")
+
+    elif chart_type == "scatter":
+        if len(numeric_cols) < 2:
+            return None
+        x_col = _select_best_x_column(dfc, query, numeric_cols, value_col)
+        dfc[x_col] = pd.to_numeric(
+            dfc[x_col].astype(str)
+                .str.replace(r'[^\d\-\.,]', '', regex=True)
+                .str.replace('.', '', regex=False)
+                .str.replace(',', '.', regex=False),
+            errors='coerce'
+        )
+        dfc = dfc.dropna(subset=[x_col])
+        if len(dfc) < 2:
+            return None
+        fig = px.scatter(dfc, x=x_col, y=value_col,
+                         title=f"Scatter Plot: {value_col} vs {x_col}",
+                         labels={value_col:"Y", x_col:"X"})
+
+    elif chart_type == "histogram":
+        fig = px.histogram(dfc, x=value_col,
+                           nbins=min(30, max(10, int(len(dfc)**0.5))),
+                           title=f"Histogram: {value_col}",
+                           labels={value_col:"Value"})
+    else:
+        # AUTO: coba scatter → bar → histogram
+        fig = _create_chart(df, "scatter", query)
+        if fig: return fig
+        fig = _create_chart(df, "bar", query)
+        if fig: return fig
+        return _create_chart(df, "histogram", query)
+
+    fig.update_layout(height=520, margin=dict(l=40, r=40, t=70, b=40))
+    return fig
+
 def generate_visualization(query: str, documents: list) -> tuple[bool, str, any]:
     """
     Generate visualization based on user query and document data.
@@ -1337,600 +1589,51 @@ def generate_visualization(query: str, documents: list) -> tuple[bool, str, any]
         return False, "", None
     
     try:
-        # Debug info
-        st.info(f"🔍 Processing visualization request: {query}")
-        st.info(f"📚 Found {len(documents)} documents")
-        
         # Extract all tables from documents
         all_tables = []
         for doc in documents:
             content = doc.get("content") or ""
-            
-            # DOCX → HTML tables
             if "<table" in content.lower():
-                html_tables = _parse_html_tables(content)
-                all_tables.extend(html_tables)
-                st.info(f"📊 Found {len(html_tables)} HTML tables in {doc.get('name', 'Unknown')}")
-            
-            # PDF/Markdown tables
-            md_tables = _parse_markdown_tables(content)
-            all_tables.extend(md_tables)
-            st.info(f"📊 Found {len(md_tables)} Markdown tables in {doc.get('name', 'Unknown')}")
+                all_tables += _parse_html_tables(content)
+            all_tables += _parse_markdown_tables(content)
         
         if not all_tables:
-            st.warning("⚠️ No tables found in documents to visualize.")
-            return False, "No tables found in documents to visualize.", None
+            return False, "Tidak ada tabel untuk divisualisasikan.", None
         
-        st.success(f"✅ Total tables found: {len(all_tables)}")
-        
-        # Find the best table for visualization
-        best_table = None
-        best_score = 0
-        
-        for i, (df, meta) in enumerate(all_tables):
-            if df.empty or df.shape[0] < 2 or df.shape[1] < 2:
+        # Pick best table
+        best = None
+        best_score = -1
+        for df, meta in all_tables:
+            if df is None or df.empty or df.shape[1] < 2 or df.shape[0] < 2:
                 continue
-            
-            # Score based on data quality
-            numeric_cols = 0
-            text_cols = 0
-            for col in df.columns:
+            numc = 0
+            for c in df.columns:
                 try:
-                    # Try to convert to numeric
-                    pd.to_numeric(df[col].astype(str).str.replace(r'[^\d\-\.,]', '', regex=True), errors='coerce')
-                    numeric_cols += 1
+                    pd.to_numeric(df[c], errors='coerce')
+                    numc += 1
                 except:
-                    text_cols += 1
-            
-            score = numeric_cols * 2 + text_cols
-            st.info(f"📈 Table {i+1}: {df.shape[0]} rows × {df.shape[1]} cols, {numeric_cols} numeric, {text_cols} text, score: {score}")
-            
+                    pass
+            score = numc*2 + (df.shape[1]-numc)
             if score > best_score:
                 best_score = score
-                best_table = (df, meta)
-        
-        if not best_table:
-            st.warning("⚠️ No suitable table data found for visualization.")
-            return False, "No suitable table data found for visualization.", None
-        
-        df, meta = best_table
-        st.success(f"✅ Selected best table: {df.shape[0]} rows × {df.shape[1]} cols")
-        
-        # Determine chart type based on query
-        ql = query.lower()
-        chart_type = "auto"
-        
-        if any(x in ql for x in ["bar", "bar chart", "grafik batang"]):
-            chart_type = "bar"
-        elif any(x in ql for x in ["line", "line chart", "grafik garis", "trend"]):
-            chart_type = "line"
-        elif any(x in ql for x in ["pie", "pie chart", "grafik lingkaran", "donut"]):
-            chart_type = "pie"
-        elif any(x in ql for x in ["scatter", "scatter plot", "scatterplot", "scatter plot"]):
-            chart_type = "scatter"
-        elif any(x in ql for x in ["histogram", "distribusi", "distribution"]):
-            chart_type = "histogram"
-        
-        st.info(f"🎯 Chart type detected: {chart_type}")
-        
-        # Generate appropriate chart
-        chart = _create_chart(df, chart_type, query, documents)
-        
-        if chart:
-            st.success(f"✅ Successfully generated {chart_type} chart!")
-            return True, f"Generated {chart_type} chart from {meta.get('doc_section', 'document')} data.", chart
-        else:
-            st.error(f"❌ Failed to generate {chart_type} chart.")
-            return False, "Failed to generate chart. Please try with different data or chart type.", None
-            
+                best = (df, meta)
+
+        if not best:
+            return False, "Tidak ada tabel yang cocok untuk grafik.", None
+
+        df, meta = best
+        chart_type = _detect_chart_type(query)
+        fig = _create_chart(df, chart_type, query)
+        if not fig:
+            return False, "Gagal membuat grafik dari tabel terpilih.", None
+
+        return True, f"Grafik {chart_type} dibuat dari data dokumen.", fig
+
     except Exception as e:
         st.error(f"❌ Error generating visualization: {str(e)}")
         import traceback
         st.error(f"Traceback: {traceback.format_exc()}")
         return False, f"Error generating visualization: {str(e)}", None
-
-def _create_document_comparison_data(query: str, documents: list) -> pd.DataFrame:
-    """Create aggregated data for document comparison in pie charts."""
-    try:
-        if not documents or len(documents) < 2:
-            return None
-            
-        comparison_data = []
-        
-        for doc in documents:
-            try:
-                doc_name = doc.get("name", "Unknown")
-                content = doc.get("content", "")
-                
-                # Count rows in tables or estimate from content
-                table_count = 0
-                
-                # Method 1: Count table rows from HTML
-                if "<table" in content.lower():
-                    # Count table rows more accurately
-                    table_rows = content.lower().count("<tr>")
-                    table_headers = content.lower().count("<th>")
-                    table_count = max(1, table_rows - table_headers)  # Subtract header rows
-                
-                # Method 2: Count from markdown tables
-                elif "|" in content:
-                    lines = content.split('\n')
-                    table_lines = [line for line in lines if '|' in line and line.strip()]
-                    # Remove separator lines (like |---|---|)
-                    separator_lines = [line for line in table_lines if re.match(r'^\s*\|[\s\-:]+\|\s*$', line)]
-                    table_count = max(1, len(table_lines) - len(separator_lines))
-                
-                # Method 3: Estimate from content length and structure
-                else:
-                    lines = content.split('\n')
-                    # Look for patterns that suggest data rows
-                    data_lines = [line for line in lines if len(line.strip()) > 10 and 
-                                (re.search(r'\d+', line) or re.search(r'[A-Za-z]+\s+[A-Za-z]+', line))]
-                    table_count = max(1, len(data_lines))
-                
-                # Ensure we have a reasonable count
-                if table_count <= 0:
-                    table_count = 1
-                
-                comparison_data.append({
-                    'document': doc_name,
-                    'count': table_count
-                })
-                
-            except Exception as e:
-                # If individual document processing fails, continue with others
-                st.warning(f"Warning: Could not process document {doc.get('name', 'Unknown')}: {str(e)}")
-                continue
-        
-        if len(comparison_data) >= 2:  # Need at least 2 documents to compare
-            df_result = pd.DataFrame(comparison_data)
-            # Sort by count descending for better visualization
-            df_result = df_result.sort_values('count', ascending=False)
-            return df_result
-        
-        return None
-        
-    except Exception as e:
-        st.error(f"Error creating document comparison data: {str(e)}")
-        return None
-
-def _create_chart(df: pd.DataFrame, chart_type: str, query: str, documents: list) -> any:
-    """Create a specific type of chart from DataFrame."""
-    try:
-        if df.empty or df.shape[0] < 2:
-            return None
-        
-        # Clean and prepare data
-        df_clean = df.copy()
-        
-        # Find numeric columns
-        numeric_cols = []
-        for col in df.columns:
-            try:
-                pd.to_numeric(df_clean[col].astype(str).str.replace(r'[^\d\-\.,]', '', regex=True), errors='coerce')
-                numeric_cols.append(col)
-            except:
-                continue
-        
-        if not numeric_cols:
-            return None
-        
-        # Smart column selection based on query context
-        value_col = _select_best_value_column(df_clean, query, numeric_cols)
-        if not value_col:
-            value_col = numeric_cols[0]  # fallback
-        
-        # Clean numeric data
-        df_clean[value_col] = pd.to_numeric(
-            df_clean[value_col].astype(str)
-                .str.replace(r'[^\d\-\.,]', '', regex=True)
-                .str.replace('.', '', regex=False)
-                .str.replace(',', '.', regex=False),
-            errors='coerce'
-        )
-        
-        # Remove rows with NaN values
-        df_clean = df_clean.dropna(subset=[value_col])
-        
-        if df_clean.empty or len(df_clean) < 2:
-            return None
-        
-        # Limit data points for better visualization
-        if len(df_clean) > 20:
-            df_clean = df_clean.head(20)
-        
-        # Create chart based on type
-        if chart_type == "bar":
-            # Find a good label column
-            label_col = _select_best_label_column(df_clean, query, value_col)
-            
-            if label_col:
-                fig = px.bar(
-                    df_clean, 
-                    x=label_col, 
-                    y=value_col,
-                    title=f"Grafik Batang: {value_col} berdasarkan {label_col}",
-                    labels={value_col: "Nilai", label_col: "Kategori"}
-                )
-            else:
-                # Use index as labels
-                fig = px.bar(
-                    df_clean, 
-                    x=df_clean.index, 
-                    y=value_col,
-                    title=f"Grafik Batang: {value_col}",
-                    labels={value_col: "Nilai", "index": "Index"}
-                )
-        
-        elif chart_type == "line":
-            # Try to find a sequential column (like dates, years, etc.)
-            seq_col = _select_best_sequence_column(df_clean, query, value_col)
-            
-            if seq_col:
-                df_clean[seq_col] = pd.to_numeric(df_clean[seq_col], errors='coerce')
-                df_clean = df_clean.sort_values(seq_col)
-                fig = px.line(
-                    df_clean, 
-                    x=seq_col, 
-                    y=value_col,
-                    title=f"Grafik Garis: {value_col} berdasarkan {seq_col}",
-                    labels={value_col: "Nilai", seq_col: "Urutan"}
-                )
-            else:
-                fig = px.line(
-                    df_clean, 
-                    x=df_clean.index, 
-                    y=value_col,
-                    title=f"Grafik Garis: {value_col}",
-                    labels={value_col: "Nilai", "index": "Index"}
-                )
-        
-        elif chart_type == "pie":
-            # Find a good label column
-            label_col = _select_best_label_column(df_clean, query, value_col)
-            
-            if label_col:
-                fig = px.pie(
-                    df_clean, 
-                    values=value_col, 
-                    names=label_col,
-                    title=f"Grafik Lingkaran: {value_col} berdasarkan {label_col}"
-                )
-            else:
-                # Try to create pie chart for document comparison
-                if "membandingkan" in query.lower() or "vs" in query.lower() or "antara" in query.lower():
-                    try:
-                        # Create aggregated data for document comparison
-                        doc_comparison_data = _create_document_comparison_data(query, documents)
-                        if doc_comparison_data is not None and not doc_comparison_data.empty:
-                            fig = px.pie(
-                                doc_comparison_data,
-                                values='count',
-                                names='document',
-                                title="Grafik Lingkaran: Perbandingan Jumlah Kandidat Antar Dokumen"
-                            )
-                        else:
-                            return None
-                    except Exception as e:
-                        st.error(f"Error creating document comparison pie chart: {str(e)}")
-                        return None
-                else:
-                    # Try to create pie chart from existing data by creating categories
-                    try:
-                        categorized_data = _create_categorized_pie_data(df_clean, value_col, query)
-                        if categorized_data is not None and not categorized_data.empty:
-                            fig = px.pie(
-                                categorized_data,
-                                values='count',
-                                names='category',
-                                title=f"Grafik Lingkaran: Distribusi {value_col} berdasarkan Kategori"
-                            )
-                        else:
-                            return None
-                    except Exception as e:
-                        st.error(f"Error creating categorized pie chart: {str(e)}")
-                        return None
-        
-        elif chart_type == "scatter":
-            # Need two numeric columns
-            if len(numeric_cols) >= 2:
-                x_col = _select_best_x_column(df_clean, query, numeric_cols, value_col)
-                df_clean[x_col] = pd.to_numeric(
-                    df_clean[x_col].astype(str)
-                        .str.replace(r'[^\d\-\.,]', '', regex=True)
-                        .str.replace('.', '', regex=False)
-                        .str.replace(',', '.', regex=False),
-                    errors='coerce'
-                )
-                df_clean = df_clean.dropna(subset=[x_col])
-                
-                if not df_clean.empty and len(df_clean) >= 2:
-                    fig = px.scatter(
-                        df_clean, 
-                        x=x_col, 
-                        y=value_col,
-                        title=f"Scatter Plot: {value_col} vs {x_col}",
-                        labels={value_col: "Nilai Y", x_col: "Nilai X"}
-                    )
-                else:
-                    return None
-            else:
-                return None  # Scatter needs two numeric columns
-        
-        elif chart_type == "histogram":
-            fig = px.histogram(
-                df_clean, 
-                x=value_col,
-                title=f"Histogram: Distribusi {value_col}",
-                labels={value_col: "Nilai"},
-                nbins=min(20, len(df_clean))
-            )
-        
-        else:  # auto - try to pick the best
-            if len(numeric_cols) >= 2:
-                # Try scatter plot
-                chart = _create_chart(df, "scatter", query, documents)
-                if chart:
-                    return chart
-            
-            # Try bar chart
-            chart = _create_chart(df, "bar", query, documents)
-            if chart:
-                return chart
-            
-            # Fallback to histogram
-            return _create_chart(df, "histogram", query, documents)
-        
-        # Update layout for better appearance
-        fig.update_layout(
-            height=500,
-            showlegend=True,
-            margin=dict(l=50, r=50, t=80, b=50),
-            font=dict(size=12),
-            hovermode='closest'
-        )
-        
-        # Add some interactivity
-        fig.update_traces(
-            hovertemplate='<b>%{x}</b><br>Nilai: %{y}<extra></extra>'
-        )
-        
-        # Add unique identifier to prevent duplicate element ID errors
-        fig.update_layout(
-            title=dict(text=fig.layout.title.text + f" (ID: {hash(str(fig))})")
-        )
-        
-        return fig
-        
-    except Exception as e:
-        st.error(f"Error creating chart: {str(e)}")
-        return None
-
-def _select_best_value_column(df: pd.DataFrame, query: str, numeric_cols: list) -> str:
-    """Select the best column for values based on query context."""
-    query_lower = query.lower()
-    
-    # Priority keywords for value columns
-    priority_keywords = {
-        'uts': ['uts', 'ujian tengah semester', 'midterm'],
-        'uas': ['uas', 'ujian akhir semester', 'final', 'ujian akhir'],
-        'nilai': ['nilai', 'score', 'skor', 'grade', 'hasil'],
-        'pendapatan': ['pendapatan', 'revenue', 'income', 'penjualan'],
-        'harga': ['harga', 'price', 'cost', 'biaya'],
-        'kuantitas': ['kuantitas', 'quantity', 'jumlah', 'volume']
-    }
-    
-    # Check for specific column names first
-    for col in df.columns:
-        col_lower = col.lower()
-        for keyword_group, keywords in priority_keywords.items():
-            if any(keyword in col_lower for keyword in keywords):
-                if col in numeric_cols:
-                    return col
-    
-    # Check for keywords in query
-    for keyword_group, keywords in priority_keywords.items():
-        if any(keyword in query_lower for keyword in keywords):
-            # Find best matching column
-            for col in numeric_cols:
-                col_lower = col.lower()
-                if any(keyword in col_lower for keyword in keywords):
-                    return col
-    
-    # If no specific match, return first numeric column
-    return numeric_cols[0] if numeric_cols else None
-
-def _select_best_label_column(df: pd.DataFrame, query: str, value_col: str) -> str:
-    """Select the best column for labels based on query context."""
-    query_lower = query.lower()
-    
-    # Priority keywords for label columns
-    label_keywords = {
-        'kandidat': ['kandidat', 'candidate', 'nama', 'name', 'mahasiswa', 'student'],
-        'bulan': ['bulan', 'month', 'periode', 'period'],
-        'kategori': ['kategori', 'category', 'jenis', 'type', 'kelompok']
-    }
-    
-    # Check for specific column names first
-    for col in df.columns:
-        if col == value_col:
-            continue
-        col_lower = col.lower()
-        
-        # Skip numeric columns for labels
-        try:
-            pd.to_numeric(df[col], errors='coerce')
-            continue
-        except:
-            pass
-        
-        # Check if column has reasonable number of unique values
-        unique_count = df[col].nunique()
-        if unique_count > 20:  # Too many unique values
-            continue
-            
-        for keyword_group, keywords in label_keywords.items():
-            if any(keyword in col_lower for keyword in keywords):
-                return col
-    
-    # Check for keywords in query
-    for keyword_group, keywords in label_keywords.items():
-        if any(keyword in query_lower for keyword in keywords):
-            for col in df.columns:
-                if col == value_col:
-                    continue
-                col_lower = col.lower()
-                try:
-                    pd.to_numeric(df[col], errors='coerce')
-                    continue
-                except:
-                    pass
-                if df[col].nunique() <= 20:
-                    return col
-    
-    # Find best non-numeric column with reasonable unique values
-    for col in df.columns:
-        if col == value_col:
-            continue
-        try:
-            pd.to_numeric(df[col], errors='coerce')
-            continue
-        except:
-            pass
-        if df[col].nunique() <= 20:
-            return col
-    
-    return None
-
-def _select_best_sequence_column(df: pd.DataFrame, query: str, value_col: str) -> str:
-    """Select the best column for sequence/x-axis in line charts."""
-    query_lower = query.lower()
-    
-    # Priority keywords for sequence columns
-    sequence_keywords = {
-        'urutan': ['urutan', 'order', 'ranking', 'peringkat', 'rank'],
-        'waktu': ['waktu', 'time', 'tanggal', 'date', 'bulan', 'month', 'tahun', 'year'],
-        'index': ['index', 'nomor', 'number', 'id']
-    }
-    
-    # Check for specific column names first
-    for col in df.columns:
-        if col == value_col:
-            continue
-        col_lower = col.lower()
-        
-        for keyword_group, keywords in sequence_keywords.items():
-            if any(keyword in col_lower for keyword in keywords):
-                try:
-                    pd.to_numeric(df[col], errors='coerce')
-                    return col
-                except:
-                    continue
-    
-    # Check for keywords in query
-    for keyword_group, keywords in sequence_keywords.items():
-        if any(keyword in query_lower for keyword in keywords):
-            for col in df.columns:
-                if col == value_col:
-                    continue
-                try:
-                    pd.to_numeric(df[col], errors='coerce')
-                    return col
-                except:
-                    continue
-    
-    # Return first numeric column that's not the value column
-    for col in df.columns:
-        if col != value_col:
-            try:
-                pd.to_numeric(df[col], errors='coerce')
-                return col
-            except:
-                continue
-    
-    return None
-
-def _select_best_x_column(df: pd.DataFrame, query: str, numeric_cols: list, value_col: str) -> str:
-    """Select the best column for x-axis in scatter plots."""
-    # Return first numeric column that's not the value column
-    for col in numeric_cols:
-        if col != value_col:
-            return col
-    return numeric_cols[0] if len(numeric_cols) > 1 else None
-
-def _create_categorized_pie_data(df: pd.DataFrame, value_col: str, query: str) -> pd.DataFrame:
-    """Create categorized data for pie charts by grouping numeric values into ranges."""
-    try:
-        if df.empty or value_col not in df.columns:
-            return None
-        
-        # Get numeric values
-        values = pd.to_numeric(df[value_col], errors='coerce').dropna()
-        if len(values) < 2:
-            return None
-        
-        # Create categories based on value ranges
-        categories = []
-        counts = []
-        
-        # For scores (0-100), create grade categories
-        if values.max() <= 100 and values.min() >= 0:
-            # Grade categories
-            grade_ranges = [
-                (90, 100, "A (90-100)"),
-                (80, 89, "B (80-89)"),
-                (70, 79, "C (70-79)"),
-                (60, 69, "D (60-69)"),
-                (0, 59, "E (<60)")
-            ]
-            
-            for min_val, max_val, label in grade_ranges:
-                count = len(values[(values >= min_val) & (values <= max_val)])
-                if count > 0:
-                    categories.append(label)
-                    counts.append(count)
-        
-        # For other numeric data, create quartile categories
-        else:
-            try:
-                q25, q50, q75 = values.quantile([0.25, 0.5, 0.75])
-                
-                quartile_ranges = [
-                    (values.min(), q25, f"Q1 ({values.min():.1f}-{q25:.1f})"),
-                    (q25, q50, f"Q2 ({q25:.1f}-{q50:.1f})"),
-                    (q50, q75, f"Q3 ({q50:.1f}-{q75:.1f})"),
-                    (q75, values.max(), f"Q4 ({q75:.1f}-{values.max():.1f})")
-                ]
-                
-                for min_val, max_val, label in quartile_ranges:
-                    count = len(values[(values >= min_val) & (values <= max_val)])
-                    if count > 0:
-                        categories.append(label)
-                        counts.append(count)
-            except Exception:
-                # Fallback: create simple ranges
-                min_val, max_val = values.min(), values.max()
-                range_size = (max_val - min_val) / 4
-                
-                for i in range(4):
-                    start = min_val + (i * range_size)
-                    end = min_val + ((i + 1) * range_size) if i < 3 else max_val
-                    count = len(values[(values >= start) & (values <= end)])
-                    if count > 0:
-                        categories.append(f"Range {i+1} ({start:.1f}-{end:.1f})")
-                        counts.append(count)
-        
-        if len(categories) > 1:  # Need at least 2 categories
-            return pd.DataFrame({
-                'category': categories,
-                'count': counts
-            })
-        
-        return None
-        
-    except Exception as e:
-        st.error(f"Error creating categorized pie data: {str(e)}")
-        return None
 
 # --------------------- UI Layout -----------------------
 col1, col2 = st.columns([1, 1])
@@ -1992,6 +1695,7 @@ with col1:
             elif ext == ".doc" or is_doc_ct:
                 chosen_kind = "doc"
 
+            # Jika HTML, coba follow link langsung ke file
             if not chosen_kind and content_type.startswith("text/html"):
                 html_text = r.text
                 links = re.findall(
@@ -2018,12 +1722,12 @@ with col1:
                         chosen_kind = "pdf"; data = tdata; clean_url = t_clean
                     elif tdata[:8] == b"\x89PNG\r\n\x1a\n" or tdata[:3] == b"\xff\xd8\xff" or any(ic in target_ct for ic in ["image/png","image/jpeg","image/jpg"]) or t_ext in [".png",".jpg",".jpeg"]:
                         chosen_kind = "image"; data = tdata; clean_url = t_clean
-                        st.session_state.image_bytes = data
                     elif t_ext == ".docx" or "vnd.openxmlformats-officedocument.wordprocessingml.document" in target_ct:
                         chosen_kind = "docx"; data = tdata; clean_url = t_clean
                     elif t_ext == ".doc" or "application/msword" in target_ct:
                         chosen_kind = "doc"; data = tdata; clean_url = t_clean
 
+                # Jika tetap tidak ketemu file, ekstrak teks HTML
                 if not chosen_kind:
                     stripped = re.sub(r"<script[\s\S]*?</script>", " ", html_text, flags=re.IGNORECASE)
                     stripped = re.sub(r"<style[\s\S]*?</style>", " ", stripped, flags=re.IGNORECASE)
@@ -2252,8 +1956,9 @@ with col2:
 
             st.dataframe(stats_data, use_container_width=True)
 
+            # ---- Kesehatan Dokumen (gauge + donut) ----
             st.markdown("### Document Health")
-            dh1, dh2 = st.columns([1,1])
+            dh1, dh2 = st.columns([1, 1])
             with dh1:
                 ocr_score = _compute_ocr_quality("\n\n".join(combined_texts))
                 fig_g = go.Figure(go.Indicator(
@@ -2261,27 +1966,43 @@ with col2:
                     value=ocr_score,
                     number={'suffix': " /100"},
                     title={'text': "OCR Quality Score"},
-                    gauge={'axis': {'range': [0,100]},
+                    gauge={'axis': {'range': [0, 100]},
                            'bar': {'thickness': 0.3},
                            'steps': [
-                               {'range': [0,50], 'color': "#fce4ec"},
-                               {'range': [50,75], 'color': "#fff3e0"},
-                               {'range': [75,100], 'color': "#e8f5e9"},
+                               {'range': [0, 50], 'color': "#fce4ec"},
+                               {'range': [50, 75], 'color': "#fff3e0"},
+                               {'range': [75, 100], 'color': "#e8f5e9"},
                            ]}
                 ))
                 st.plotly_chart(fig_g, use_container_width=True, key="ocr_gauge_chart")
 
             with dh2:
                 labels = ["Text", "Tables", "Images"]
-                values = [max(1, struct_total["text"]), max(1, struct_total["tables"]), max(1, struct_total["images"])]
-                fig_donut = px.pie(values=values, names=labels, hole=0.6, title="Document Structure Overview")
+                struct_total = struct_total  # already computed above
+                values = [
+                    max(1, struct_total["text"]),
+                    max(1, struct_total["tables"]),
+                    max(1, struct_total["images"]),
+                ]
+                fig_donut = px.pie(
+                    values=values,
+                    names=labels,
+                    hole=0.6,
+                    title="Document Structure Overview"
+                )
                 st.plotly_chart(fig_donut, use_container_width=True, key="structure_donut_chart")
 
+            # ---- Heatmap Missing Data ----
             secs = _extract_sections("\n\n".join(combined_texts))
             sec_labels, cat_labels, mat = _missing_matrix(secs)
-            fig_heat = px.imshow(mat, aspect="auto", color_continuous_scale="Viridis",
-                                 labels=dict(x="Section", y="Missing Type", color="Count"),
-                                 x=sec_labels, y=cat_labels)
+            fig_heat = px.imshow(
+                mat,
+                aspect="auto",
+                color_continuous_scale="Viridis",
+                labels=dict(x="Section", y="Missing Type", color="Count"),
+                x=sec_labels,
+                y=cat_labels
+            )
             fig_heat.update_layout(title="Missing Data Heatmap")
             st.plotly_chart(fig_heat, use_container_width=True, key="missing_data_heatmap")
 
@@ -2289,13 +2010,13 @@ with col2:
         for i, m in enumerate(st.session_state.chat_history):
             role = "You" if m["role"] == "user" else "Assistant"
             st.markdown(f"**{role}:** {m['content']}")
-            
-            # Display chart if available
             if m.get("chart") and m["role"] == "assistant":
                 st.markdown("📊 **Visualization:**")
-                st.plotly_chart(m["chart"], use_container_width=True, key=f"chart_{i}_{hash(str(m.get('chart_message', '')))}")
-                
-                # Show chart info
+                st.plotly_chart(
+                    m["chart"],
+                    use_container_width=True,
+                    key=f"chart_{i}_{hash(str(m.get('chart_message', '')))}"
+                )
                 if m.get("chart_message"):
                     st.info(m["chart_message"])
 
@@ -2313,68 +2034,93 @@ with col2:
                 ans = None
                 chart = None
                 chart_message = ""
-                
+
                 try:
                     docs_to_use = select_docs_for_query(user_q, st.session_state.documents)
-                    
-                    # Check for visualization intent first
+
+                    # 1) Coba buat visualisasi dulu
                     viz_success, viz_msg, viz_chart = generate_visualization(user_q, docs_to_use)
                     if viz_success:
                         chart = viz_chart
                         chart_message = viz_msg
                         if ANSWER_LANGUAGE == "Bahasa Indonesia":
-                            ans = f"✅ {chart_message}\n\nSaya telah membuat visualisasi berdasarkan data dari dokumen Anda. Grafik ditampilkan di bawah ini."
+                            ans = (
+                                f"✅ {chart_message}\n\n"
+                                "Saya telah membuat visualisasi berdasarkan data dari dokumen Anda. "
+                                "Grafik ditampilkan di bawah ini."
+                            )
                         else:
-                            ans = f"✅ {chart_message}\n\nI have created a visualization based on your document data. The chart is displayed below."
+                            ans = (
+                                f"✅ {chart_message}\n\n"
+                                "I have created a visualization based on your document data. "
+                                "The chart is displayed below."
+                            )
                     else:
-                        # Try average calculation
+                        # 2) Jika tidak, coba hitung rata-rata
                         avg_results = compute_average_per_doc(user_q, docs_to_use)
                         if avg_results:
                             if len(avg_results) == 1:
                                 r = avg_results[0]
-                                val_str = f"{r['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                                val_str = (
+                                    f"{r['value']:,.4f}"
+                                    .replace(",", "X").replace(".", ",").replace("X", ".")
+                                )
                                 if ANSWER_LANGUAGE == "Bahasa Indonesia":
-                                    ans = f"Rata-rata di dokumen **{r['doc']}** untuk kolom **{r['column']}** adalah **{val_str}** (n={r['n']})."
+                                    ans = (
+                                        f"Rata-rata di dokumen **{r['doc']}** untuk kolom "
+                                        f"**{r['column']}** adalah **{val_str}** (n={r['n']})."
+                                    )
                                 else:
-                                    ans = f"The average in document **{r['doc']}** for column **{r['column']}** is **{val_str}** (n={r['n']})."
+                                    ans = (
+                                        f"The average in document **{r['doc']}** for column "
+                                        f"**{r['column']}** is **{val_str}** (n={r['n']})."
+                                    )
                             else:
-                                ans_lines = []
+                                lines = []
                                 for r in avg_results:
-                                    val_str = f"{r['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
-                                    ans_lines.append(f"- **{r['doc']}** → {val_str} (n={r['n']})")
+                                    val_str = (
+                                        f"{r['value']:,.4f}"
+                                        .replace(",", "X").replace(".", ",").replace("X", ".")
+                                    )
+                                    lines.append(f"- **{r['doc']}** → {val_str} (n={r['n']})")
                                 best = max(avg_results, key=lambda x: x["value"])
                                 if ANSWER_LANGUAGE == "Bahasa Indonesia":
-                                    ans = "Hasil rata-rata per dokumen:\n" + "\n".join(ans_lines)
-                                    ans += f"\n\n📊 Nilai tertinggi ada di **{best['doc']}** dengan rata-rata {best['value']:.2f}."
+                                    ans = "Hasil rata-rata per dokumen:\n" + "\n".join(lines)
+                                    ans += (
+                                        f"\n\n📊 Nilai tertinggi ada di **{best['doc']}** "
+                                        f"dengan rata-rata {best['value']:.2f}."
+                                    )
                                 else:
-                                    ans = "Average per document:\n" + "\n".join(ans_lines)
-                                    ans += f"\n\n📊 Highest is in **{best['doc']}** with average {best['value']:.2f}."
-                
+                                    ans = "Average per document:\n" + "\n".join(lines)
+                                    ans += (
+                                        f"\n\n📊 Highest is in **{best['doc']}** "
+                                        f"with average {best['value']:.2f}."
+                                    )
+
                 except Exception as e:
                     st.error(f"Error processing query: {str(e)}")
-                    avg_results = []
-                
+
                 if not ans:
                     if not google_api_key:
                         ans = "Please provide a valid Google API Key."
                     else:
                         ans = generate_response_with_fallback(st.session_state.ocr_content, user_q)
-                
-                # Store response with chart info
-                response_data = {"role": "assistant", "content": ans}
+
+                # simpan jawaban (sertakan chart bila ada)
+                resp = {"role": "assistant", "content": ans}
                 if chart:
-                    response_data["chart"] = chart
-                    response_data["chart_message"] = chart_message
-                
-                st.session_state.chat_history.append(response_data)
+                    resp["chart"] = chart
+                    resp["chart_message"] = chart_message
+                st.session_state.chat_history.append(resp)
                 st.rerun()
 
     else:
+        # ---- Tidak ada dokumen: izinkan tanya pakai URL saja ----
         st.info("No documents processed yet. You can either upload files or just type a URL below and press Ask.")
         with st.form("qa_form_nodocs", clear_on_submit=True):
             user_q = st.text_input(
                 "Your question (can ask about specific documents or compare them):",
-                key="qa_input"
+                key="qa_input_nodocs"
             )
             submitted = st.form_submit_button("Ask")
 
@@ -2392,65 +2138,86 @@ with col2:
                     ans = None
                     chart = None
                     chart_message = ""
-                    
+
                     try:
                         docs_to_use = select_docs_for_query(user_q, st.session_state.documents)
-                        
-                        # Check for visualization intent first
+
                         viz_success, viz_msg, viz_chart = generate_visualization(user_q, docs_to_use)
                         if viz_success:
                             chart = viz_chart
                             chart_message = viz_msg
                             if ANSWER_LANGUAGE == "Bahasa Indonesia":
-                                ans = f"✅ {chart_message}\n\nSaya telah membuat visualisasi berdasarkan data dari dokumen Anda. Grafik ditampilkan di bawah ini."
+                                ans = (
+                                    f"✅ {chart_message}\n\n"
+                                    "Saya telah membuat visualisasi berdasarkan data dari dokumen Anda. "
+                                    "Grafik ditampilkan di bawah ini."
+                                )
                             else:
-                                ans = f"✅ {chart_message}\n\nI have created a visualization based on your document data. The chart is displayed below."
+                                ans = (
+                                    f"✅ {chart_message}\n\n"
+                                    "I have created a visualization based on your document data. "
+                                    "The chart is displayed below."
+                                )
                         else:
-                            # Try average calculation
                             avg_results = compute_average_per_doc(user_q, docs_to_use)
                             if avg_results:
                                 if len(avg_results) == 1:
                                     r = avg_results[0]
-                                    val_str = f"{r['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                                    val_str = (
+                                        f"{r['value']:,.4f}"
+                                        .replace(",", "X").replace(".", ",").replace("X", ".")
+                                    )
                                     if ANSWER_LANGUAGE == "Bahasa Indonesia":
-                                        ans = f"Rata-rata di dokumen **{r['doc']}** untuk kolom **{r['column']}** adalah **{val_str}** (n={r['n']})."
+                                        ans = (
+                                            f"Rata-rata di dokumen **{r['doc']}** untuk kolom "
+                                            f"**{r['column']}** adalah **{val_str}** (n={r['n']})."
+                                        )
                                     else:
-                                        ans = f"The average in document **{r['doc']}** for column **{r['column']}** is **{val_str}** (n={r['n']})."
+                                        ans = (
+                                            f"The average in document **{r['doc']}** for column "
+                                            f"**{r['column']}** is **{val_str}** (n={r['n']})."
+                                        )
                                 else:
-                                    ans_lines = []
+                                    lines = []
                                     for r in avg_results:
-                                        val_str = f"{r['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
-                                        ans_lines.append(f"- **{r['doc']}** → {val_str} (n={r['n']})")
+                                        val_str = (
+                                            f"{r['value']:,.4f}"
+                                            .replace(",", "X").replace(".", ",").replace("X", ".")
+                                        )
+                                        lines.append(f"- **{r['doc']}** → {val_str} (n={r['n']})")
                                     best = max(avg_results, key=lambda x: x["value"])
                                     if ANSWER_LANGUAGE == "Bahasa Indonesia":
-                                        ans = "Hasil rata-rata per dokumen:\n" + "\n".join(ans_lines)
-                                        ans += f"\n\n📊 Nilai tertinggi ada di **{best['doc']}** dengan rata-rata {best['value']:.2f}."
+                                        ans = "Hasil rata-rata per dokumen:\n" + "\n".join(lines)
+                                        ans += (
+                                            f"\n\n📊 Nilai tertinggi ada di **{best['doc']}** "
+                                            f"dengan rata-rata {best['value']:.2f}."
+                                        )
                                     else:
-                                        ans = "Average per document:\n" + "\n".join(ans_lines)
-                                        ans += f"\n\n📊 Highest is in **{best['doc']}** with average {best['value']:.2f}."
-                    
+                                        ans = "Average per document:\n" + "\n".join(lines)
+                                        ans += (
+                                            f"\n\n📊 Highest is in **{best['doc']}** "
+                                            f"with average {best['value']:.2f}."
+                                        )
+
                     except Exception as e:
                         st.error(f"Error processing query: {str(e)}")
-                        avg_results = []
-                    
+
                     if not ans:
                         if not google_api_key:
                             ans = "Please provide a valid Google API Key."
                         else:
                             ans = generate_response_with_fallback(st.session_state.ocr_content, user_q)
-                    
-                    # Store response with chart info
-                    response_data = {"role": "assistant", "content": ans}
+
+                    resp = {"role": "assistant", "content": ans}
                     if chart:
-                        response_data["chart"] = chart
-                        response_data["chart_message"] = chart_message
-                    
-                    st.session_state.chat_history.append(response_data)
+                        resp["chart"] = chart
+                        resp["chart_message"] = chart_message
+                    st.session_state.chat_history.append(resp)
                     st.rerun()
             else:
                 st.warning("Please provide a URL or upload a document first.")
 
-# Tampilkan konten hasil OCR/ekstraksi
+# ---- Tampilkan konten hasil OCR/ekstraksi ----
 if st.session_state.get("documents"):
     with st.expander("📄 View All Document Contents"):
         for i, doc in enumerate(st.session_state.documents):
@@ -2461,173 +2228,3 @@ if st.session_state.get("documents"):
                 st.markdown(doc['content'])
             st.markdown("---")
 
-def _create_average_comparison_data(query: str, documents: list) -> pd.DataFrame:
-    """Create aggregated data for average value comparison in pie charts."""
-    try:
-        if not documents or len(documents) < 2:
-            return None
-            
-        comparison_data = []
-        
-        for doc in documents:
-            try:
-                doc_name = doc.get("name", "Unknown")
-                content = doc.get("content", "")
-                
-                # Extract tables from document content
-                tables = []
-                
-                # HTML tables
-                if "<table" in content.lower():
-                    tables.extend(_parse_html_tables(content))
-                
-                # Markdown tables
-                tables.extend(_parse_markdown_tables(content))
-                
-                # Find best table with UTS/UAS data
-                best_avg = None
-                best_score = 0
-                
-                for df, meta in tables:
-                    if df.empty or df.shape[0] < 2:
-                        continue
-                    
-                    # Look for UTS/UAS columns
-                    uts_col = None
-                    uas_col = None
-                    
-                    for col in df.columns:
-                        col_lower = col.lower()
-                        if any(keyword in col_lower for keyword in ["uts", "ujian tengah", "midterm"]):
-                            uts_col = col
-                        elif any(keyword in col_lower for keyword in ["uas", "ujian akhir", "final"]):
-                            uas_col = col
-                    
-                    # Calculate average from UTS or UAS column
-                    if uts_col or uas_col:
-                        target_col = uts_col if uts_col else uas_col
-                        
-                        # Clean numeric data
-                        df_clean = df.copy()
-                        df_clean[target_col] = pd.to_numeric(
-                            df_clean[target_col].astype(str)
-                                .str.replace(r'[^\d\-\.,]', '', regex=True)
-                                .str.replace('.', '', regex=False)
-                                .str.replace(',', '.', regex=False),
-                            errors='coerce'
-                        )
-                        
-                        # Remove NaN values
-                        df_clean = df_clean.dropna(subset=[target_col])
-                        
-                        if len(df_clean) >= 2:
-                            # Filter reasonable values (0-100 for scores)
-                            valid_values = df_clean[target_col][(df_clean[target_col] >= 0) & (df_clean[target_col] <= 100)]
-                            
-                            if len(valid_values) >= 2:
-                                avg_value = float(valid_values.mean())
-                                score = len(valid_values)  # More data = better score
-                                
-                                if score > best_score:
-                                    best_score = score
-                                    best_avg = {
-                                        'document': doc_name,
-                                        'average_value': avg_value,
-                                        'count': len(valid_values),
-                                        'column': target_col
-                                    }
-                
-                # If no UTS/UAS data found, try to find any numeric column
-                if best_avg is None:
-                    for df, meta in tables:
-                        if df.empty or df.shape[0] < 2:
-                            continue
-                        
-                        # Find numeric columns
-                        numeric_cols = []
-                        for col in df.columns:
-                            try:
-                                pd.to_numeric(df[col].astype(str).str.replace(r'[^\d\-\.,]', '', regex=True), errors='coerce')
-                                numeric_cols.append(col)
-                            except:
-                                continue
-                        
-                        if numeric_cols:
-                            # Use first numeric column
-                            target_col = numeric_cols[0]
-                            df_clean = df.copy()
-                            df_clean[target_col] = pd.to_numeric(
-                                df_clean[target_col].astype(str)
-                                    .str.replace(r'[^\d\-\.,]', '', regex=True)
-                                    .str.replace('.', '', regex=False)
-                                    .str.replace(',', '.', regex=False),
-                                errors='coerce'
-                            )
-                            
-                            df_clean = df_clean.dropna(subset=[target_col])
-                            if len(df_clean) >= 2:
-                                avg_value = float(df_clean[target_col].mean())
-                                score = len(df_clean)
-                                
-                                if score > best_score:
-                                    best_score = score
-                                    best_avg = {
-                                        'document': doc_name,
-                                        'average_value': avg_value,
-                                        'count': len(df_clean),
-                                        'column': target_col
-                                    }
-                
-                if best_avg:
-                    comparison_data.append(best_avg)
-                else:
-                    # Fallback: use document count
-                    table_count = _estimate_document_data_count(content)
-                    comparison_data.append({
-                        'document': doc_name,
-                        'average_value': table_count,  # Use count as fallback
-                        'count': table_count,
-                        'column': 'estimated_count'
-                    })
-                
-            except Exception as e:
-                st.warning(f"Warning: Could not process document {doc.get('name', 'Unknown')}: {str(e)}")
-                continue
-        
-        if len(comparison_data) >= 2:  # Need at least 2 documents to compare
-            df_result = pd.DataFrame(comparison_data)
-            # Sort by average value descending for better visualization
-            df_result = df_result.sort_values('average_value', ascending=False)
-            return df_result
-        
-        return None
-        
-    except Exception as e:
-        st.error(f"Error creating average comparison data: {str(e)}")
-        return None
-
-def _estimate_document_data_count(content: str) -> int:
-    """Estimate the number of data rows in a document."""
-    try:
-        # Method 1: Count table rows from HTML
-        if "<table" in content.lower():
-            table_rows = content.lower().count("<tr>")
-            table_headers = content.lower().count("<th>")
-            return max(1, table_rows - table_headers)
-        
-        # Method 2: Count from markdown tables
-        elif "|" in content:
-            lines = content.split('\n')
-            table_lines = [line for line in lines if '|' in line and line.strip()]
-            separator_lines = [line for line in table_lines if re.match(r'^\s*\|[\s\-:]+\|\s*$', line)]
-            return max(1, len(table_lines) - len(separator_lines))
-        
-        # Method 3: Estimate from content
-        else:
-            lines = content.split('\n')
-            data_lines = [line for line in lines if len(line.strip()) > 10 and 
-                        (re.search(r'\d+', line) or re.search(r'[A-Za-z]+\s+[A-Za-z]+', line))]
-            return max(1, len(data_lines))
-            
-    except Exception:
-        return 1
